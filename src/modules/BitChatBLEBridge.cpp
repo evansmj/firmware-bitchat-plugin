@@ -10,6 +10,10 @@
 #include <NimBLEService.h>
 #include <NimBLECharacteristic.h>
 
+// Service and characteristic created in NimbleBluetooth.cpp during initial BLE setup
+extern NimBLEService *bitchatBLEService;
+extern NimBLECharacteristic *bitchatBLECharacteristic;
+
 // Forward declaration for callback class
 class BitChatBLECharacteristicCallbacks;
 
@@ -220,47 +224,36 @@ bool BitChatBLEBridge::setupBitChatService(NimBLEServer* server)
         LOG_ERROR("BitChat BLE: No BLE server available");
         return false;
     }
-    
+
     std::lock_guard<std::mutex> lock(bleMutex);
-    
+
     try {
-        // Create BitChat service
-        bitchatService = server->createService(NimBLEUUID(BITCHAT_SERVICE_UUID));
-        if (!bitchatService) {
-            LOG_ERROR("BitChat BLE: Failed to create BitChat service");
+        // Use the service and characteristic created in NimbleBluetooth::setupService()
+        // They must be created during initial BLE setup before advertising starts
+        if (!bitchatBLEService || !bitchatBLECharacteristic) {
+            LOG_ERROR("BitChat BLE: Service not created during BLE init - check NimbleBluetooth.cpp");
             return false;
         }
-        
-        // Create BitChat characteristic
-        bitchatCharacteristic = bitchatService->createCharacteristic(
-            NimBLEUUID(BITCHAT_CHARACTERISTIC_UUID),
-            NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
-        );
-        
-        if (!bitchatCharacteristic) {
-            LOG_ERROR("BitChat BLE: Failed to create BitChat characteristic");
-            return false;
-        }
-        
-        // Set initial empty value
-        bitchatCharacteristic->setValue((uint8_t*)nullptr, 0);
-        LOG_DEBUG("BitChat BLE: Created characteristic with READ, WRITE, WRITE_NR, NOTIFY (OPEN permissions)");
-        
+
+        // Store references to the pre-created service and characteristic
+        bitchatService = bitchatBLEService;
+        bitchatCharacteristic = bitchatBLECharacteristic;
+
+        LOG_DEBUG("BitChat BLE: Using pre-created service and characteristic from NimbleBluetooth");
+
         // Set up callbacks
         if (!characteristicCallbacks) {
             characteristicCallbacks = new BitChatBLECharacteristicCallbacks();
         }
-        
+
         bitchatCharacteristic->setCallbacks(characteristicCallbacks);
         activeBridge = this; // Set global pointer for callbacks
-        
-        // Start the service
-        bitchatService->start();
+
         serviceActive = true;
-        
+
         LOG_INFO("BitChat BLE: Service setup complete (characteristic callbacks registered)");
         return true;
-        
+
     } catch (const std::exception& e) {
         LOG_ERROR("BitChat BLE: Exception during service setup: %s", e.what());
         return false;

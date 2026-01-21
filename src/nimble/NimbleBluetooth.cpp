@@ -26,6 +26,11 @@ NimBLECharacteristic *BatteryCharacteristic;
 NimBLECharacteristic *logRadioCharacteristic;
 NimBLEServer *bleServer;
 
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+NimBLEService *bitchatBLEService = nullptr;
+NimBLECharacteristic *bitchatBLECharacteristic = nullptr;
+#endif
+
 static bool passkeyShowing;
 
 class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
@@ -445,6 +450,28 @@ void NimbleBluetooth::setupService()
     batteryLevelDescriptor->setUnit(0x27ad);
 
     batteryService->start();
+
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    // Setup the BitChat service - must be created here before advertising starts
+    LOG_INFO("NimBLE: Setting up BitChat service");
+    bitchatBLEService = bleServer->createService(NimBLEUUID(BITCHAT_SERVICE_UUID));
+    if (bitchatBLEService) {
+        bitchatBLECharacteristic = bitchatBLEService->createCharacteristic(
+            NimBLEUUID(BITCHAT_CHARACTERISTIC_UUID),
+            NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
+        );
+        if (bitchatBLECharacteristic) {
+            bitchatBLECharacteristic->setValue((uint8_t*)nullptr, 0);
+            LOG_INFO("NimBLE: BitChat characteristic created with READ, WRITE, WRITE_NR, NOTIFY");
+        } else {
+            LOG_ERROR("NimBLE: Failed to create BitChat characteristic");
+        }
+        bitchatBLEService->start();
+        LOG_INFO("NimBLE: BitChat service started");
+    } else {
+        LOG_ERROR("NimBLE: Failed to create BitChat service");
+    }
+#endif
 }
 
 void NimbleBluetooth::startAdvertising()

@@ -112,14 +112,13 @@ int32_t BitChatBridgeModule::runOnce()
             if (bleBridge.setupBitChatService(bleServer)) {
                 LOG_INFO("BitChat Bridge: BLE service setup successful (ESP32)");
                 bleServiceSetup = true;
-                
+
+                // No need to restart advertising - service was created in NimbleBluetooth::setupService()
+                // before advertising started, so GATT table is already correct
+                LOG_INFO("BitChat Bridge: BitChat service available in GATT table");
+
                 LOG_INFO("BitChat Bridge: Creating initial announcement for BLE characteristic...");
                 sendPeerAnnouncement();  // This will create and broadcast the announcement immediately
-                
-                // Don't restart advertising - the service is already registered with GATT
-                // and the BitChat UUID is already in the scan response from initial advertising
-                // NimBLE will automatically include all started services in GATT table
-                LOG_INFO("BitChat Bridge: BitChat service available in GATT table");
             } else {
                 LOG_ERROR("BitChat Bridge: BLE service setup failed");
                 bleEnabled = false;
