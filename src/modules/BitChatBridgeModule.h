@@ -290,6 +290,17 @@ private:
     uint8_t ed25519PublicKey[32];     // Ed25519 public key (32 bytes)
     bool ed25519KeysInitialized = false; // Track if keys have been generated/loaded
     
+    // Rate-limiting for announcements relayed BLE->Mesh (per sender)
+    // Only relay one announcement per sender every ANNOUNCE_RELAY_INTERVAL_MS
+    struct AnnouncementRateEntry {
+        uint32_t senderId;
+        uint32_t lastRelayTime; // millis()
+    };
+    static constexpr size_t MAX_RATE_LIMIT_ENTRIES = 16;
+    static constexpr uint32_t ANNOUNCE_RELAY_INTERVAL_MS = 300000; // 5 minutes
+    AnnouncementRateEntry announceRateLimit[MAX_RATE_LIMIT_ENTRIES];
+    size_t announceRateLimitCount = 0;
+
     // Message queue for deferring heavy processing from BLE callbacks to main loop
     // BLE callbacks have limited stack, so we queue messages and process them in runOnce()
     // Use simple fixed-size circular buffer (no dynamic allocation, safe for early initialization)
@@ -348,6 +359,7 @@ public:
 private:
     // Internal helpers
     bool shouldRelayMessage(const BitChatMessage& msg);
+    bool isAnnouncementRateLimited(const BitChatMessage& msg);
     void updateStatistics();
     void logMessage(const BitChatMessage& msg, const char* action);
     

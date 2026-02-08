@@ -289,6 +289,10 @@ void BitChatBridgeModule::processBitChatMessage(const BitChatMessage& msg, bool 
     }
     
     if (fromBLE) {
+        // Rate-limit announcements to avoid flooding LoRa mesh
+        if (msg.type == BITCHAT_MSG_ANNOUNCE && isAnnouncementRateLimited(msg)) {
+            return;
+        }
         relayToMesh(msg);
     } else {
         broadcastToBLE(msg);
@@ -426,6 +430,51 @@ bool BitChatBridgeModule::shouldRelayMessage(const BitChatMessage& msg)
             LOG_WARN("BitChat Bridge: Unknown message type 0x%02x", msg.type);
             return false;
     }
+}
+
+bool BitChatBridgeModule::isAnnouncementRateLimited(const BitChatMessage& msg)
+{
+    uint32_t senderId = msg.getSenderId32();
+    uint32_t now = millis();
+
+    // Check if we already have an entry for this sender
+    for (size_t i = 0; i < announceRateLimitCount; i++) {
+        if (announceRateLimit[i].senderId == senderId) {
+            uint32_t elapsed = now - announceRateLimit[i].lastRelayTime;
+            if (elapsed < ANNOUNCE_RELAY_INTERVAL_MS) {
+                LOG_DEBUG("BitChat Bridge: Rate-limiting announcement from 0x%08x (%d seconds until next relay)",
+                          senderId, (ANNOUNCE_RELAY_INTERVAL_MS - elapsed) / 1000);
+                return true; // Rate-limited
+            }
+            // Interval passed — allow relay and update timestamp
+            announceRateLimit[i].lastRelayTime = now;
+            LOG_INFO("BitChat Bridge: Relaying announcement from 0x%08x to mesh (rate-limit interval passed)", senderId);
+            return false;
+        }
+    }
+
+    // New sender — add entry
+    if (announceRateLimitCount < MAX_RATE_LIMIT_ENTRIES) {
+        announceRateLimit[announceRateLimitCount].senderId = senderId;
+        announceRateLimit[announceRateLimitCount].lastRelayTime = now;
+        announceRateLimitCount++;
+    } else {
+        // Table full — evict oldest entry
+        uint32_t oldestTime = now;
+        size_t oldestIdx = 0;
+        for (size_t i = 0; i < MAX_RATE_LIMIT_ENTRIES; i++) {
+            uint32_t age = now - announceRateLimit[i].lastRelayTime;
+            if (age > (now - oldestTime)) {
+                oldestTime = announceRateLimit[i].lastRelayTime;
+                oldestIdx = i;
+            }
+        }
+        announceRateLimit[oldestIdx].senderId = senderId;
+        announceRateLimit[oldestIdx].lastRelayTime = now;
+    }
+
+    LOG_INFO("BitChat Bridge: Relaying first announcement from 0x%08x to mesh", senderId);
+    return false; // First time — allow relay
 }
 
 void BitChatBridgeModule::updateStatistics()
