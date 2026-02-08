@@ -15,6 +15,7 @@
 #ifdef ARCH_ESP32
 #include "nimble/NimbleBluetooth.h"
 extern NimBLEServer *bleServer;
+extern NimbleBluetooth *nimbleBluetooth;
 #elif defined(ARCH_NRF52)
 #include "platform/nrf52/NRF52Bluetooth.h"
 extern NRF52Bluetooth *nrf52Bluetooth;
@@ -109,17 +110,25 @@ int32_t BitChatBridgeModule::runOnce()
         LOG_DEBUG("BitChat Bridge: Attempting BLE service setup...");
 #ifdef ARCH_ESP32
         if (bleServer) {
+            // Set bridge module reference BEFORE service setup so callbacks work
+            bleBridge.setBridgeModule(this);
+
             if (bleBridge.setupBitChatService(bleServer)) {
                 LOG_INFO("BitChat Bridge: BLE service setup successful (ESP32)");
                 bleServiceSetup = true;
-                
+
+                // Stop and restart advertising so phones discover the newly created GATT service.
+                // Without this, a phone that connected before the service was ready will cache
+                // the incomplete GATT table and never find BitChat on subsequent connections.
+                // This matches the nRF52 pattern (Bluefruit.Advertising.stop / resumeAdvertising).
+                if (nimbleBluetooth && !nimbleBluetooth->isDeInit) {
+                    LOG_INFO("BitChat Bridge: Restarting advertising with BitChat service...");
+                    nimbleBluetooth->startAdvertising();
+                    LOG_INFO("BitChat Bridge: Advertising restarted");
+                }
+
                 LOG_INFO("BitChat Bridge: Creating initial announcement for BLE characteristic...");
-                sendPeerAnnouncement();  // This will create and broadcast the announcement immediately
-                
-                // Don't restart advertising - the service is already registered with GATT
-                // and the BitChat UUID is already in the scan response from initial advertising
-                // NimBLE will automatically include all started services in GATT table
-                LOG_INFO("BitChat Bridge: BitChat service available in GATT table");
+                sendPeerAnnouncement();
             } else {
                 LOG_ERROR("BitChat Bridge: BLE service setup failed");
                 bleEnabled = false;
@@ -153,10 +162,15 @@ int32_t BitChatBridgeModule::runOnce()
 #endif
     }
     
-    // On both ESP32 and nRF52, advertising is handled by the core Bluetooth stack
-    // (NimbleBluetooth for ESP32, NRF52Bluetooth for nRF52)
-    // BitChat UUID is added during core advertising setup, so no plugin-level management needed
-    // Both services remain advertised continuously
+    // Periodically ensure advertising is active on ESP32 (safety net).
+    // NimBLE stops advertising on connect and relies on onDisconnect to restart it,
+    // but if that callback is missed for any reason, advertising stays off silently.
+    // nRF52's Bluefruit.Advertising.restartOnDisconnect(true) handles this automatically.
+#ifdef ARCH_ESP32
+    if (bleServiceSetup && nimbleBluetooth) {
+        nimbleBluetooth->ensureAdvertising();
+    }
+#endif
 #endif
     
     // Send periodic peer announcements (act as a BitChat peer)
