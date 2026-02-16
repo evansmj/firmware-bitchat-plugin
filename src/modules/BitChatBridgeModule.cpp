@@ -122,9 +122,10 @@ int32_t BitChatBridgeModule::runOnce()
                 // the incomplete GATT table and never find BitChat on subsequent connections.
                 // This matches the nRF52 pattern (Bluefruit.Advertising.stop / resumeAdvertising).
                 if (nimbleBluetooth && !nimbleBluetooth->isDeInit) {
-                    LOG_INFO("BitChat Bridge: Restarting advertising with BitChat service...");
+                    nimbleBluetooth->setBitChatServiceReady();
+                    LOG_INFO("BitChat Bridge: Starting advertising with BitChat service...");
                     nimbleBluetooth->startAdvertising();
-                    LOG_INFO("BitChat Bridge: Advertising restarted");
+                    LOG_INFO("BitChat Bridge: Advertising started");
                 }
 
                 LOG_INFO("BitChat Bridge: Creating initial announcement for BLE characteristic...");
@@ -132,6 +133,11 @@ int32_t BitChatBridgeModule::runOnce()
             } else {
                 LOG_ERROR("BitChat Bridge: BLE service setup failed");
                 bleEnabled = false;
+                if (nimbleBluetooth && !nimbleBluetooth->isDeInit) {
+                    LOG_WARN("BitChat Bridge: Starting advertising without BitChat service");
+                    nimbleBluetooth->setBitChatServiceReady();
+                    nimbleBluetooth->startAdvertising();
+                }
             }
         }
 #elif defined(ARCH_NRF52)

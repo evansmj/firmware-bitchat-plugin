@@ -391,7 +391,17 @@ void NimbleBluetooth::setup()
     LOG_DEBUG("NimBLE: Setting up BLE services...");
     setupService();
     LOG_DEBUG("NimBLE: BLE services setup complete");
-    
+
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    bitChatAdvertisingDeferred = true;
+    LOG_INFO("NimBLE: Deferring advertising until BitChat service is ready");
+#endif
+
+    if (bitChatAdvertisingDeferred) {
+        LOG_INFO("NimBLE: Advertising deferred - waiting for BitChat service setup");
+        return;
+    }
+
     LOG_DEBUG("NimBLE: Starting BLE advertising...");
     startAdvertising();
     LOG_DEBUG("NimBLE: startAdvertising() call completed");
@@ -449,6 +459,12 @@ void NimbleBluetooth::setupService()
 
 void NimbleBluetooth::startAdvertising()
 {
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    if (bitChatAdvertisingDeferred) {
+        LOG_INFO("NimBLE: Advertising deferred until BitChat service is ready");
+        return;
+    }
+#endif
 #ifdef NIMBLE_TWO
     NimBLEExtAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
     NimBLEExtAdvertisement legacyAdvertising;
@@ -627,6 +643,16 @@ void NimbleBluetooth::startAdvertising()
         #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
         LOG_ERROR("NimBLE: Scan resp: name='%s' + BitChat UUID (128-bit)", shortName);
         #endif
+    }
+#endif
+}
+
+void NimbleBluetooth::setBitChatServiceReady()
+{
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    if (bitChatAdvertisingDeferred) {
+        bitChatAdvertisingDeferred = false;
+        LOG_INFO("NimBLE: BitChat service ready, advertising can start");
     }
 #endif
 }
