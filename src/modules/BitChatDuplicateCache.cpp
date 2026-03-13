@@ -11,7 +11,7 @@ uint32_t BitChatDuplicateCache::calculateHash(const BitChatMessage& msg)
     // This creates a unique fingerprint for each message
     
     struct HashData {
-        uint32_t senderId;
+        uint64_t senderId;
         uint32_t timestamp;
         uint8_t messageType;
         uint8_t payloadLength;
@@ -19,7 +19,7 @@ uint32_t BitChatDuplicateCache::calculateHash(const BitChatMessage& msg)
     } __attribute__((packed));
     
     HashData hashData = {};
-    hashData.senderId = msg.getSenderId32();
+    hashData.senderId = msg.senderId;
     // Use lower 32 bits of timestamp for hash (for backward compatibility)
     hashData.timestamp = static_cast<uint32_t>(msg.timestamp & 0xFFFFFFFFULL);
     hashData.messageType = msg.type;
@@ -54,7 +54,7 @@ bool BitChatDuplicateCache::isDuplicate(const BitChatMessage& msg)
     for (size_t i = 0; i < cache.size(); i++) {
         const auto& entry = cache[i];
         
-        uint32_t msgSenderId = msg.getSenderId32();
+        uint64_t msgSenderId = msg.senderId;
         uint32_t msgTimestamp32 = static_cast<uint32_t>(msg.timestamp & 0xFFFFFFFFULL);
         
         // Check for exact match
@@ -89,7 +89,7 @@ void BitChatDuplicateCache::addMessage(const BitChatMessage& msg)
     // Add message to cache using circular buffer
     auto& entry = cache[currentIndex];
     
-    entry.senderId = msg.getSenderId32();
+    entry.senderId = msg.senderId;
     // Use lower 32 bits of timestamp for cache (for backward compatibility)
     entry.timestamp = static_cast<uint32_t>(msg.timestamp & 0xFFFFFFFFULL);
     entry.messageType = msg.type;

@@ -1,5 +1,6 @@
 #pragma once
 #include "SinglePortModule.h"
+#include "BitChatTopologyManager.h"
 #include "concurrency/OSThread.h"
 #include "mesh/MeshModule.h"
 #include <array>
@@ -21,15 +22,20 @@
 #endif
 
 // BitChat Protocol Constants
-#define BITCHAT_HEADER_SIZE 13  // Updated to match iOS format: version(1) + type(1) + ttl(1) + timestamp(8) + flags(1) + payloadLength(2) = 13
+#define BITCHAT_HEADER_SIZE_V1 13
+#define BITCHAT_HEADER_SIZE_V2 16
 #define BITCHAT_SIGNATURE_SIZE 64  // Ed25519 signature is 64 bytes
 #define BITCHAT_MAX_PAYLOAD_SIZE 245  // Increased to handle larger announcements
-#define BITCHAT_VERSION 1  // Protocol version (matches iOS)
+#define BITCHAT_VERSION 1
+#define BITCHAT_VERSION_1 1
+#define BITCHAT_VERSION_2 2
+#define BITCHAT_CURRENT_VERSION BITCHAT_VERSION_2
 #define BITCHAT_SERVICE_UUID "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C"
 #define BITCHAT_CHARACTERISTIC_UUID "A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D"
 #define BITCHAT_DUPLICATE_CACHE_SIZE 100
 #define BITCHAT_BLE_TIME_WINDOW_MS 30000  // 30 seconds - long enough to be discovered
 #define BITCHAT_BLE_INTERVAL_MS 35000     // 35 seconds between windows
+#define BITCHAT_MAX_HOPS 8                // Max hops for source routing
 
 // Fragmentation Constants
 #define BITCHAT_FRAGMENT_HEADER_SIZE 6    // fragment_id(2) + index(1) + total(1) + original_size(2)
@@ -65,6 +71,7 @@ enum BLEMode {
 #define BITCHAT_FLAG_HAS_RECIPIENT 0x01
 #define BITCHAT_FLAG_HAS_SIGNATURE 0x02
 #define BITCHAT_FLAG_IS_COMPRESSED 0x04
+#define BITCHAT_FLAG_HAS_ROUTE     0x08
 
 /**
  * BitChat Protocol Message Structure
@@ -75,34 +82,38 @@ struct BitChatMessage {
     uint8_t type;           // Message type (0x01-0x07)
     uint8_t ttl;            // Time to live
     uint64_t timestamp;     // Unix timestamp (8 bytes, milliseconds since epoch)
-    uint8_t flags;          // Flags: hasRecipient(0x01), hasSignature(0x02), isCompressed(0x04)
-    uint16_t payloadLength; // Length of payload (2 bytes)
-    uint8_t senderId[8];    // Sender ID (8 bytes, padded)
-    uint8_t recipientId[8]; // Recipient ID (8 bytes, optional, based on flags)
-    uint8_t payload[BITCHAT_MAX_PAYLOAD_SIZE]; // Message payload
-    uint8_t signature[BITCHAT_SIGNATURE_SIZE]; // Ed25519 signature (64 bytes, optional, based on flags)
+    uint8_t flags;          // Flags
+    uint32_t payloadLength; // Length of payload (4 bytes in V2)
+    uint64_t senderId;    // Sender ID (8 bytes, padded)
+    uint64_t recipientId; // Recipient ID (8 bytes, optional, based on flags)
     
-    // Helper to get senderId as uint32_t (for backward compatibility)
-    uint32_t getSenderId32() const {
-        uint32_t id = 0;
-        for (int i = 0; i < 4; i++) {
-            id |= (static_cast<uint32_t>(senderId[i]) << (i * 8));
-        }
-        return id;
+    // Source Routing (V2)
+    uint8_t routeCount;
+    uint64_t route[BITCHAT_MAX_HOPS]; // Intermediate hops
+    
+    uint8_t payload[BITCHAT_MAX_PAYLOAD_SIZE]; // Message payload
+    uint8_t signature[BITCHAT_SIGNATURE_SIZE]; // Ed25519 signature
+    
+    uint64_t getSenderId() const {
+        return this->senderId;
     }
     
     // Helper to set senderId from uint32_t
-    void setSenderId32(uint32_t id) {
-        memset(senderId, 0, 8);
-        for (int i = 0; i < 4; i++) {
-            senderId[i] = static_cast<uint8_t>((id >> (i * 8)) & 0xFF);
+    void setSenderId(uint64_t id) {
+        this->senderId = id;
+    }
+
+    void decrementTtl() {
+        if (this->ttl > 1) {
+            this->ttl--;
         }
     }
     
     // Constructor
-    BitChatMessage() : version(BITCHAT_VERSION), type(0), ttl(0), timestamp(0), flags(0), payloadLength(0) {
-        memset(senderId, 0, sizeof(senderId));
-        memset(recipientId, 0, sizeof(recipientId));
+    BitChatMessage() : version(BITCHAT_CURRENT_VERSION), type(0), ttl(0), timestamp(0), flags(0), payloadLength(0), routeCount(0) {
+        senderId = 0;
+        recipientId = 0;
+        memset(route, 0, sizeof(route));
         memset(payload, 0, sizeof(payload));
         memset(signature, 0, sizeof(signature));
     }
@@ -114,7 +125,7 @@ struct BitChatMessage {
 class BitChatDuplicateCache {
 private:
     struct CacheEntry {
-        uint32_t senderId;
+        uint64_t senderId;
         uint32_t timestamp;
         uint8_t messageType;
         uint32_t hash;
@@ -204,14 +215,40 @@ private:
     bool serviceActive = false;
     
     // BLE write reassembly buffer (for handling MTU-limited writes from peripheral role)
-    // Buffer must accommodate: header(13) + sender(8) + recipient(8) + payload(245) + signature(64) = 338 bytes
-    static constexpr size_t BITCHAT_MAX_MESSAGE_SIZE = BITCHAT_HEADER_SIZE + 8 + 8 + BITCHAT_MAX_PAYLOAD_SIZE + BITCHAT_SIGNATURE_SIZE;
+    // Buffer must accommodate: header(13/16) + sender(8) + recipient(8) + route(var) + payload(245) + signature(64) = ~400 bytes
+    // Use slightly larger buffer to be safe
+    static constexpr size_t BITCHAT_MAX_MESSAGE_SIZE = 512;
     uint8_t writeBuffer[BITCHAT_MAX_MESSAGE_SIZE];
     size_t writeBufferOffset = 0;
     uint32_t lastWriteTime = 0;
     static constexpr uint32_t WRITE_TIMEOUT_MS = 5000; // Clear buffer if no write for 5 seconds
     
+    // Track connected handles for non-V2 NimBLE API workaround
+    std::vector<uint16_t> connectedHandles;
+    
 public:
+    void addConnection(uint16_t handle) {
+        if (std::find(connectedHandles.begin(), connectedHandles.end(), handle) == connectedHandles.end()) {
+            connectedHandles.push_back(handle);
+        }
+    }
+    
+    void removeConnection(uint16_t handle) {
+        auto it = std::remove(connectedHandles.begin(), connectedHandles.end(), handle);
+        connectedHandles.erase(it, connectedHandles.end());
+    }
+    
+    void clearConnections() {
+        connectedHandles.clear();
+    }
+    
+    uint16_t getSingleConnectionHandle() {
+        if (connectedHandles.size() == 1) {
+            return connectedHandles[0];
+        }
+        return 0xFFFF;
+    }
+
 #ifdef ARCH_ESP32
     bool setupBitChatService(NimBLEServer* server);
 #elif defined(ARCH_NRF52)
@@ -220,12 +257,13 @@ public:
     void startAdvertising();
     void stopAdvertising();
     void broadcastMessage(const BitChatMessage& msg);
+    void unicastMessage(uint16_t connHandle, const BitChatMessage& msg);
     bool isServiceActive() const { return serviceActive; }
     // Set bridge module reference for callbacks
     void setBridgeModule(class BitChatBridgeModule* module) { bridgeModule = module; }
     
     // BLE Callbacks - Peripheral Role (Server)
-    void onBitChatWrite(const uint8_t* data, size_t length);
+    void onBitChatWrite(const uint8_t* data, size_t length, uint16_t connHandle);
     void onBitChatConnect();
     void onBitChatDisconnect();
     void handleBitChatDisconnect(uint16_t connHandle, uint8_t reason);
@@ -254,6 +292,7 @@ private:
     // Core components
     BitChatDuplicateCache duplicateCache;
     FragmentReassemblyBuffer fragmentBuffer;
+    BitChatTopologyManager topologyManager; // Tracks direct neighbors
     uint16_t nextFragmentId = 1;  // Counter for generating unique fragment IDs
     
 #if !MESHTASTIC_EXCLUDE_BLUETOOTH
@@ -308,13 +347,15 @@ private:
     struct QueuedMessage {
         BitChatMessage msg;
         bool fromBLE;
+        uint16_t bleConnHandle;
     };
     static constexpr size_t MAX_QUEUE_SIZE = 8;
     QueuedMessage messageQueue[MAX_QUEUE_SIZE];
     volatile size_t messageQueueHead = 0;  // Index of next message to process
     volatile size_t messageQueueTail = 0;  // Index of next free slot
     volatile size_t messageQueueCount = 0; // Number of messages in queue
-    
+    volatile bool shouldSendAnnouncement = false; // Flag to trigger announcement from main loop
+
 public:
     /** Constructor */
     BitChatBridgeModule();
@@ -334,9 +375,10 @@ protected:
     
 public:
     // BitChat message handling
-    void processBitChatMessage(const BitChatMessage& msg, bool fromBLE = false);
-    void queueMessageForProcessing(const BitChatMessage& msg, bool fromBLE); // Queue message for deferred processing
+    void processBitChatMessage(BitChatMessage& msg, bool fromBLE = false, uint16_t bleConnHandle = 0xFFFF);
+    void queueMessageForProcessing(const BitChatMessage& msg, bool fromBLE, uint16_t bleConnHandle = 0xFFFF); // Queue message for deferred processing
     void broadcastToBLE(const BitChatMessage& msg);
+    void unicastToBLE(uint16_t connHandle, const BitChatMessage& msg);
     void relayToMesh(const BitChatMessage& msg);
     
     // Configuration
@@ -355,6 +397,7 @@ public:
     
     // Peer announcement (public so BLE bridge can call on connection)
     void sendPeerAnnouncement();
+    void requestPeerAnnouncement();
     
 private:
     // Internal helpers

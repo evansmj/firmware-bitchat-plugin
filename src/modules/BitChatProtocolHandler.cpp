@@ -1,5 +1,6 @@
 #include "BitChatBridgeModule.h"
 #include "configuration.h"
+#include "meshUtils.h"
 #include "mesh/MeshService.h"
 #include "mesh/Router.h"
 #include "NodeDB.h"
@@ -12,71 +13,117 @@
 
 bool BitChatProtocolHandler::parseMessage(const uint8_t* data, size_t length, BitChatMessage& msg)
 {
-    if (!data || length < BITCHAT_HEADER_SIZE) {
-        LOG_WARN("BitChat: Invalid message - too short (%d bytes)", length);
+    if (!data || length < 1) {
+        LOG_WARN("BitChat: Invalid message - empty");
         return false;
     }
 
-    // Parse 13-byte BitChat header (iOS-compatible format)
-    size_t offset = 0;
+    // Peak at version (Byte 0)
+    uint8_t version = data[0];
+    size_t headerSize = 0;
     
-    // Byte 0: Version
-    msg.version = data[offset++];
-    if (msg.version != BITCHAT_VERSION) {
-        LOG_WARN("BitChat: Unsupported version %d (expected %d)", msg.version, BITCHAT_VERSION);
+    if (version == BITCHAT_VERSION_1) {
+        headerSize = BITCHAT_HEADER_SIZE_V1;
+    } else if (version == BITCHAT_VERSION_2) {
+        headerSize = BITCHAT_HEADER_SIZE_V2;
+    } else {
+        LOG_WARN("BitChat: Unsupported version %d", version);
         return false;
     }
     
-    // Byte 1: Message type
+    if (length < headerSize) {
+        LOG_WARN("BitChat: Invalid message - too short for header (%d < %d)", length, headerSize);
+        return false;
+    }
+
+    // Parse Fixed Header
+    size_t offset = 0;
+    msg.version = data[offset++];
     msg.type = data[offset++];
-    
-    // Byte 2: TTL
     msg.ttl = data[offset++];
     
-    // Bytes 3-10: Timestamp (8 bytes, big-endian)
+    // Timestamp (8 bytes)
     msg.timestamp = 0;
     for (int i = 0; i < 8; i++) {
         msg.timestamp = (msg.timestamp << 8) | static_cast<uint64_t>(data[offset++]);
     }
     
-    // Byte 11: Flags
     msg.flags = data[offset++];
-    bool hasRecipient = (msg.flags & BITCHAT_FLAG_HAS_RECIPIENT) != 0;
-    bool hasSignature = (msg.flags & BITCHAT_FLAG_HAS_SIGNATURE) != 0;
-    bool isCompressed = (msg.flags & BITCHAT_FLAG_IS_COMPRESSED) != 0;
     
-    // Bytes 12-13: Payload length (2 bytes, big-endian)
-    msg.payloadLength = (static_cast<uint16_t>(data[offset]) << 8) | static_cast<uint16_t>(data[offset + 1]);
-    offset += 2;
-    
-    // Bytes 14-21: Sender ID (8 bytes)
-    memcpy(msg.senderId, data + offset, 8);
-    offset += 8;
-    
-    // Bytes 22-29: Recipient ID (8 bytes, optional)
-    if (hasRecipient) {
-        memcpy(msg.recipientId, data + offset, 8);
-        offset += 8;
+    // Payload Length
+    if (version == BITCHAT_VERSION_2) {
+        msg.payloadLength = (static_cast<uint32_t>(data[offset]) << 24) |
+                            (static_cast<uint32_t>(data[offset + 1]) << 16) |
+                            (static_cast<uint32_t>(data[offset + 2]) << 8) |
+                            static_cast<uint32_t>(data[offset + 3]);
+        offset += 4;
     } else {
-        memset(msg.recipientId, 0, 8);
+        msg.payloadLength = (static_cast<uint16_t>(data[offset]) << 8) | static_cast<uint16_t>(data[offset + 1]);
+        offset += 2;
     }
     
-    // Validate payload length
+    bool hasRecipient = (msg.flags & BITCHAT_FLAG_HAS_RECIPIENT) != 0;
+    bool hasSignature = (msg.flags & BITCHAT_FLAG_HAS_SIGNATURE) != 0;
+    bool hasRoute = (version >= BITCHAT_VERSION_2) && ((msg.flags & BITCHAT_FLAG_HAS_ROUTE) != 0);
+    bool isCompressed = (msg.flags & BITCHAT_FLAG_IS_COMPRESSED) != 0;
+    
+    // Validate minimum remaining length
+    // SenderID (8) + RecipientID (opt 8) + Route (opt var) + Payload + Signature (opt 64)
+    size_t minRemaining = 8 + (hasRecipient ? 8 : 0) + (hasSignature ? BITCHAT_SIGNATURE_SIZE : 0) + msg.payloadLength;
+    if (length - offset < minRemaining) {
+        LOG_WARN("BitChat: Message truncated (expected at least %d more bytes, got %d)", minRemaining, length - offset);
+        return false;
+    }
+    
+    // Sender ID
+    memcpy(&msg.senderId, data + offset, sizeof(msg.senderId));
+    offset += sizeof(msg.senderId);
+    
+    // Recipient ID
+    if (hasRecipient) {
+        memcpy(&msg.recipientId, data + offset, sizeof(msg.recipientId));
+        offset += sizeof(msg.recipientId);
+    } else {
+        msg.recipientId = 0;
+    }
+    
+    // Source Route (V2 only)
+    msg.routeCount = 0;
+    if (hasRoute) {
+        // Read Count (1 byte)
+        if (offset >= length) return false;
+        uint8_t count = data[offset++];
+        
+        if (count > BITCHAT_MAX_HOPS) {
+             LOG_WARN("BitChat: Route too long (%d hops), truncating to %d", count, BITCHAT_MAX_HOPS);
+             LOG_WARN("BitChat: Route too long, rejecting");
+             return false;
+        }
+        
+        // Check size
+        if (length - offset < (size_t)(count * 8)) {
+            LOG_WARN("BitChat: Truncated route data");
+            return false;
+        }
+        
+        msg.routeCount = count;
+        for (int i = 0; i < count; i++) {
+            uint64_t hopId = 0;
+            for (int b = 0; b < 8; b++) {
+                hopId = (hopId << 8) | data[offset++];
+            }
+            msg.route[i] = hopId;
+        }
+    }
+    
+    // Validate payload length again vs MAX
     if (msg.payloadLength > BITCHAT_MAX_PAYLOAD_SIZE) {
         LOG_WARN("BitChat: Payload too large (%d bytes)", msg.payloadLength);
         return false;
     }
     
-    // Calculate minimum required length
-    size_t minLength = BITCHAT_HEADER_SIZE + 8 + (hasRecipient ? 8 : 0) + msg.payloadLength + (hasSignature ? BITCHAT_SIGNATURE_SIZE : 0);
-    if (length < minLength) {
-        LOG_WARN("BitChat: Message truncated (expected %d, got %d)", minLength, length);
-        return false;
-    }
-    
-    // Payload (with optional compression handling)
+    // Payload
     if (isCompressed) {
-        // For now, we don't support compression - log warning and fail
         LOG_WARN("BitChat: Compressed payload not supported yet");
         return false;
     }
@@ -85,14 +132,12 @@ bool BitChatProtocolHandler::parseMessage(const uint8_t* data, size_t length, Bi
         memcpy(msg.payload, data + offset, msg.payloadLength);
         offset += msg.payloadLength;
     }
-    
-    // Zero out remaining payload buffer
+    // Zero rest
     if (msg.payloadLength < BITCHAT_MAX_PAYLOAD_SIZE) {
-        memset(msg.payload + msg.payloadLength, 0, 
-               BITCHAT_MAX_PAYLOAD_SIZE - msg.payloadLength);
+         memset(msg.payload + msg.payloadLength, 0, BITCHAT_MAX_PAYLOAD_SIZE - msg.payloadLength);
     }
     
-    // Signature (64 bytes, optional)
+    // Signature
     if (hasSignature) {
         memcpy(msg.signature, data + offset, BITCHAT_SIGNATURE_SIZE);
         offset += BITCHAT_SIGNATURE_SIZE;
@@ -100,18 +145,23 @@ bool BitChatProtocolHandler::parseMessage(const uint8_t* data, size_t length, Bi
         memset(msg.signature, 0, BITCHAT_SIGNATURE_SIZE);
     }
     
-    LOG_DEBUG("BitChat: Parsed message type=0x%02x, sender=0x%08x, ttl=%d, payload=%d bytes, flags=0x%02x",
-              msg.type, msg.getSenderId32(), msg.ttl, msg.payloadLength, msg.flags);
-    
+    LOG_DEBUG("BitChat: Parsed V%d msg type=0x%02x, len=%d, route=%d hops", 
+              msg.version, msg.type, msg.payloadLength, msg.routeCount);
+              
     return true;
 }
 
 size_t BitChatProtocolHandler::serializeMessage(const BitChatMessage& msg, uint8_t* buffer, size_t maxLength)
 {
-    // Calculate required length
+    // Determine header size based on version
+    size_t headerSize = (msg.version >= BITCHAT_VERSION_2) ? BITCHAT_HEADER_SIZE_V2 : BITCHAT_HEADER_SIZE_V1;
+    
     bool hasRecipient = (msg.flags & BITCHAT_FLAG_HAS_RECIPIENT) != 0;
     bool hasSignature = (msg.flags & BITCHAT_FLAG_HAS_SIGNATURE) != 0;
-    size_t requiredLength = BITCHAT_HEADER_SIZE + 8 + (hasRecipient ? 8 : 0) + msg.payloadLength + (hasSignature ? BITCHAT_SIGNATURE_SIZE : 0);
+    bool hasRoute = (msg.version >= BITCHAT_VERSION_2) && ((msg.flags & BITCHAT_FLAG_HAS_ROUTE) != 0);
+    
+    size_t routeSize = hasRoute ? (1 + msg.routeCount * 8) : 0;
+    size_t requiredLength = headerSize + 8 + (hasRecipient ? 8 : 0) + routeSize + msg.payloadLength + (hasSignature ? BITCHAT_SIGNATURE_SIZE : 0);
     
     if (!buffer || maxLength < requiredLength) {
         return 0;
@@ -119,35 +169,48 @@ size_t BitChatProtocolHandler::serializeMessage(const BitChatMessage& msg, uint8
     
     size_t offset = 0;
     
-    // Byte 0: Version
+    // Header
     buffer[offset++] = msg.version;
-    
-    // Byte 1: Message type
     buffer[offset++] = msg.type;
-    
-    // Byte 2: TTL
     buffer[offset++] = msg.ttl;
     
-    // Bytes 3-10: Timestamp (8 bytes, big-endian)
+    // Timestamp (Big Endian)
     for (int i = 7; i >= 0; i--) {
         buffer[offset++] = static_cast<uint8_t>((msg.timestamp >> (i * 8)) & 0xFF);
     }
     
-    // Byte 11: Flags
     buffer[offset++] = msg.flags;
     
-    // Bytes 12-13: Payload length (2 bytes, big-endian)
-    buffer[offset++] = static_cast<uint8_t>((msg.payloadLength >> 8) & 0xFF);
-    buffer[offset++] = static_cast<uint8_t>(msg.payloadLength & 0xFF);
+    // Payload Length
+    if (msg.version >= BITCHAT_VERSION_2) {
+        buffer[offset++] = (msg.payloadLength >> 24) & 0xFF;
+        buffer[offset++] = (msg.payloadLength >> 16) & 0xFF;
+        buffer[offset++] = (msg.payloadLength >> 8) & 0xFF;
+        buffer[offset++] = msg.payloadLength & 0xFF;
+    } else {
+        buffer[offset++] = (msg.payloadLength >> 8) & 0xFF;
+        buffer[offset++] = msg.payloadLength & 0xFF;
+    }
     
-    // Bytes 14-21: Sender ID (8 bytes)
-    memcpy(buffer + offset, msg.senderId, 8);
+    // Sender ID
+    memcpy(buffer + offset, &msg.senderId, sizeof(msg.senderId));
     offset += 8;
     
-    // Bytes 22-29: Recipient ID (8 bytes, optional)
+    // Recipient ID
     if (hasRecipient) {
-        memcpy(buffer + offset, msg.recipientId, 8);
+        memcpy(buffer + offset, &msg.recipientId, sizeof(msg.recipientId));
         offset += 8;
+    }
+    
+    // Route (V2)
+    if (hasRoute) {
+        buffer[offset++] = msg.routeCount;
+        for (int i = 0; i < msg.routeCount; i++) {
+            uint64_t hop = msg.route[i];
+            for (int b = 7; b >= 0; b--) {
+                buffer[offset++] = (hop >> (b * 8)) & 0xFF;
+            }
+        }
     }
     
     // Payload
@@ -156,21 +219,22 @@ size_t BitChatProtocolHandler::serializeMessage(const BitChatMessage& msg, uint8
         offset += msg.payloadLength;
     }
     
-    // Signature (64 bytes, optional)
+    // Signature
     if (hasSignature) {
         memcpy(buffer + offset, msg.signature, BITCHAT_SIGNATURE_SIZE);
         offset += BITCHAT_SIGNATURE_SIZE;
     }
     
-    LOG_DEBUG("BitChat: Serialized message %d bytes (flags=0x%02x)", offset, msg.flags);
+    LOG_DEBUG("BitChat: Serialized V%d msg %d bytes (route=%d)", msg.version, offset, msg.routeCount);
+    printBytes("BitChat Outgoing", buffer, offset);
     return offset;
 }
 
 bool BitChatProtocolHandler::validateMessage(const BitChatMessage& msg)
 {
     // Check version
-    if (msg.version != BITCHAT_VERSION) {
-        LOG_WARN("BitChat: Invalid version %d (expected %d)", msg.version, BITCHAT_VERSION);
+    if (msg.version != BITCHAT_VERSION_1 && msg.version != BITCHAT_VERSION_2) {
+        LOG_WARN("BitChat: Invalid version %d", msg.version);
         return false;
     }
     
@@ -251,9 +315,13 @@ meshtastic_MeshPacket* BitChatProtocolHandler::createMeshtasticPacket(const BitC
     const uint32_t BITCHAT_MAGIC = 0x42434854; // "BCHT"
     
     // Calculate actual message size (same calculation as serializeMessage)
+    size_t headerSize = (bitchatMsg.version >= BITCHAT_VERSION_2) ? BITCHAT_HEADER_SIZE_V2 : BITCHAT_HEADER_SIZE_V1;
     bool hasRecipient = (bitchatMsg.flags & BITCHAT_FLAG_HAS_RECIPIENT) != 0;
     bool hasSignature = (bitchatMsg.flags & BITCHAT_FLAG_HAS_SIGNATURE) != 0;
-    size_t messageSize = BITCHAT_HEADER_SIZE + 8 + (hasRecipient ? 8 : 0) + bitchatMsg.payloadLength + (hasSignature ? BITCHAT_SIGNATURE_SIZE : 0);
+    bool hasRoute = (bitchatMsg.version >= BITCHAT_VERSION_2) && ((bitchatMsg.flags & BITCHAT_FLAG_HAS_ROUTE) != 0);
+    size_t routeSize = hasRoute ? (1 + bitchatMsg.routeCount * 8) : 0;
+    
+    size_t messageSize = headerSize + 8 + (hasRecipient ? 8 : 0) + routeSize + bitchatMsg.payloadLength + (hasSignature ? BITCHAT_SIGNATURE_SIZE : 0);
     size_t totalSize = sizeof(BITCHAT_MAGIC) + messageSize;
     
     if (totalSize > sizeof(packet->decoded.payload.bytes)) {
@@ -303,7 +371,7 @@ bool BitChatProtocolHandler::extractBitChatMessage(const meshtastic_MeshPacket& 
     
     // Check for minimum size (magic + header)
     const uint32_t BITCHAT_MAGIC = 0x42434854; // "BCHT"
-    if (meshPacket.decoded.payload.size < sizeof(BITCHAT_MAGIC) + BITCHAT_HEADER_SIZE) {
+    if (meshPacket.decoded.payload.size < sizeof(BITCHAT_MAGIC) + 1) { // At least magic + version
         return false;
     }
     
@@ -328,7 +396,7 @@ bool BitChatProtocolHandler::extractBitChatMessage(const meshtastic_MeshPacket& 
     }
     
     LOG_DEBUG("BitChat: Extracted message type=0x%02x, sender=0x%08x, ttl=%d, payload=%d bytes",
-              bitchatMsg.type, bitchatMsg.getSenderId32(), bitchatMsg.ttl, bitchatMsg.payloadLength);
+              bitchatMsg.type, bitchatMsg.senderId, bitchatMsg.ttl, bitchatMsg.payloadLength);
     
     return true;
 }

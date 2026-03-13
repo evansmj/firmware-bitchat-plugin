@@ -37,7 +37,7 @@ bool FragmentReassemblyBuffer::addFragment(const BitChatMessage& fragment, uint1
         memset(buffer->fragmentsReceived, 0, sizeof(buffer->fragmentsReceived));
         
         // Store original message metadata from first fragment
-        buffer->originalMessage.setSenderId32(fragment.getSenderId32());
+        buffer->originalMessage.senderId = fragment.senderId;
         buffer->originalMessage.timestamp = fragment.timestamp;
         buffer->originalMessage.ttl = fragment.ttl;
         
@@ -117,7 +117,7 @@ bool FragmentReassemblyBuffer::getReassembledMessage(uint16_t fragmentId, BitCha
             
             // Reconstruct original message
             outMsg.type = buffer.originalMessage.type;
-            outMsg.setSenderId32(buffer.originalMessage.getSenderId32());
+            outMsg.senderId = buffer.originalMessage.senderId;
             outMsg.timestamp = buffer.originalMessage.timestamp;
             outMsg.ttl = buffer.originalMessage.ttl;
             outMsg.payloadLength = buffer.originalSize;
@@ -132,7 +132,7 @@ bool FragmentReassemblyBuffer::getReassembledMessage(uint16_t fragmentId, BitCha
             memcpy(outMsg.payload, buffer.reassemblyBuffer, buffer.originalSize);
             
             LOG_INFO("BitChat Fragment: Reassembled message type 0x%02x, sender 0x%08x, %d bytes",
-                     outMsg.type, outMsg.getSenderId32(), outMsg.payloadLength);
+                     outMsg.type, outMsg.senderId, outMsg.payloadLength);
             
             // Clear buffer
             buffer.totalFragments = 0;
