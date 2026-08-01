@@ -53,7 +53,7 @@ void test_parse_announce_message(void) {
     
     TEST_ASSERT_TRUE(result);
     TEST_ASSERT_EQUAL(BITCHAT_MSG_ANNOUNCE, msg.type);
-    TEST_ASSERT_EQUAL(0x12345678, msg.senderId);
+    TEST_ASSERT_EQUAL(0x12345678, msg.getSenderId32());
     TEST_ASSERT_EQUAL(1234567890, msg.timestamp);
     TEST_ASSERT_EQUAL(60, msg.ttl);
     TEST_ASSERT_EQUAL(11, msg.payloadLength);
@@ -93,7 +93,7 @@ void test_serialize_message(void) {
     // Create a message
     BitChatMessage msg;
     msg.type = BITCHAT_MSG_MESSAGE;
-    msg.senderId = 0x12345678;
+    msg.setSenderId32(0x12345678);
     msg.timestamp = 1234567890;
     msg.ttl = 60;
     msg.payloadLength = 11;
@@ -122,7 +122,7 @@ void test_serialize_message(void) {
 void test_serialize_buffer_too_small(void) {
     BitChatMessage msg;
     msg.type = BITCHAT_MSG_MESSAGE;
-    msg.senderId = 0x12345678;
+    msg.setSenderId32(0x12345678);
     msg.timestamp = 1234567890;
     msg.ttl = 60;
     msg.payloadLength = 100;
@@ -137,7 +137,7 @@ void test_serialize_buffer_too_small(void) {
 void test_validate_message_valid(void) {
     BitChatMessage msg;
     msg.type = BITCHAT_MSG_MESSAGE;
-    msg.senderId = 0x12345678;
+    msg.setSenderId32(0x12345678);
     msg.timestamp = 1234567890;
     msg.ttl = 60;
     msg.payloadLength = 10;
@@ -149,7 +149,7 @@ void test_validate_message_valid(void) {
 void test_validate_message_invalid_type(void) {
     BitChatMessage msg;
     msg.type = 0x99;  // Invalid type
-    msg.senderId = 0x12345678;
+    msg.setSenderId32(0x12345678);
     msg.timestamp = 1234567890;
     msg.ttl = 60;
     msg.payloadLength = 10;
@@ -161,7 +161,7 @@ void test_validate_message_invalid_type(void) {
 void test_validate_message_payload_too_large(void) {
     BitChatMessage msg;
     msg.type = BITCHAT_MSG_MESSAGE;
-    msg.senderId = 0x12345678;
+    msg.setSenderId32(0x12345678);
     msg.timestamp = 1234567890;
     msg.ttl = 60;
     msg.payloadLength = BITCHAT_MAX_PAYLOAD_SIZE + 1;  // Too large
@@ -174,7 +174,7 @@ void test_roundtrip_serialize_parse(void) {
     // Create original message
     BitChatMessage original;
     original.type = BITCHAT_MSG_ANNOUNCE;
-    original.senderId = 0xABCDEF12;
+    original.setSenderId32(0xABCDEF12);
     original.timestamp = 1700000000;
     original.ttl = 120;
     original.payloadLength = 20;
@@ -192,7 +192,7 @@ void test_roundtrip_serialize_parse(void) {
     
     // Verify roundtrip
     TEST_ASSERT_EQUAL(original.type, parsed.type);
-    TEST_ASSERT_EQUAL(original.senderId, parsed.senderId);
+    TEST_ASSERT_EQUAL(original.getSenderId32(), parsed.getSenderId32());
     TEST_ASSERT_EQUAL(original.timestamp, parsed.timestamp);
     TEST_ASSERT_EQUAL(original.ttl, parsed.ttl);
     TEST_ASSERT_EQUAL(original.payloadLength, parsed.payloadLength);
