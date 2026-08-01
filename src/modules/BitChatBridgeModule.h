@@ -1,12 +1,14 @@
 #pragma once
 #include "SinglePortModule.h"
 #include "concurrency/OSThread.h"
+#include "gps/RTC.h"
 #include "mesh/MeshModule.h"
 #include <array>
 #include <vector>
 #include <memory>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 
 #if !MESHTASTIC_EXCLUDE_BLUETOOTH
 #ifdef ARCH_ESP32
@@ -115,10 +117,10 @@ class BitChatDuplicateCache {
 private:
     struct CacheEntry {
         uint32_t senderId;
-        uint32_t timestamp;
+        uint64_t timestamp;
         uint8_t messageType;
         uint32_t hash;
-        
+
         CacheEntry() : senderId(0), timestamp(0), messageType(0), hash(0) {}
     };
     
@@ -163,6 +165,64 @@ public:
     void cleanup(uint32_t currentTime);
 };
 
+/**
+ * A queued BitChat message awaiting deferred processing in runOnce().
+ */
+struct QueuedMessage {
+    BitChatMessage msg;
+    bool fromBLE = false;
+};
+
+/**
+ * Lock-free single-producer/single-consumer ring buffer.
+ * The producer (BLE callback task) only writes `tail`; the consumer (main task) only
+ * writes `head`. One slot is left empty to distinguish full from empty, so usable
+ * capacity is CAPACITY - 1. On overflow push() drops the new message (never touches the
+ * consumer's `head`, preserving the SPSC invariant). Standalone for unit testing.
+ */
+// Single-producer/single-consumer ring. On ESP32 the producer (NimBLE host task) and the
+// consumer (Arduino loop task) run on different cores, so plain `volatile` is not enough:
+// it stops compiler reordering but gives no cross-core visibility ordering, letting the
+// consumer observe an advanced `tail` before the slot write behind it is visible. head/tail
+// are std::atomic with release/acquire so the slot write is published before the index that
+// exposes it, and seen before the slot is read.
+struct BitChatMessageRing {
+    static constexpr size_t CAPACITY = 9; // 8 usable slots
+    QueuedMessage slots[CAPACITY];
+    std::atomic<size_t> head{0}; // next slot to read (consumer writes)
+    std::atomic<size_t> tail{0}; // next slot to write (producer writes)
+
+    bool empty() const {
+        return head.load(std::memory_order_relaxed) == tail.load(std::memory_order_relaxed);
+    }
+    bool full() const {
+        return ((tail.load(std::memory_order_relaxed) + 1) % CAPACITY) == head.load(std::memory_order_acquire);
+    }
+
+    // Producer side. Returns false if the ring was full (message dropped).
+    bool push(const QueuedMessage& m) {
+        size_t t = tail.load(std::memory_order_relaxed);
+        size_t next = (t + 1) % CAPACITY;
+        if (next == head.load(std::memory_order_acquire)) {
+            return false; // full - drop new message
+        }
+        slots[t] = m;
+        tail.store(next, std::memory_order_release); // publish slot before exposing it
+        return true;
+    }
+
+    // Consumer side. Returns false if the ring was empty.
+    bool pop(QueuedMessage& out) {
+        size_t h = head.load(std::memory_order_relaxed);
+        if (h == tail.load(std::memory_order_acquire)) {
+            return false; // empty
+        }
+        out = slots[h];
+        head.store((h + 1) % CAPACITY, std::memory_order_release); // free slot after reading
+        return true;
+    }
+};
+
 #if !MESHTASTIC_EXCLUDE_BLUETOOTH
 /**
  * BLE Time Manager for coordinating BLE access between Meshtastic and BitChat
@@ -192,9 +252,11 @@ private:
     
     // Peripheral role (server) - receives writes from phone
 #ifdef ARCH_ESP32
+    NimBLEServer* bitchatServer = nullptr; // for querying negotiated ATT MTU
     NimBLEService* bitchatService = nullptr;
     NimBLECharacteristic* bitchatCharacteristic = nullptr;
     std::mutex bleMutex;
+    size_t getPeripheralNotificationLimit(); // usable notify payload = min peer MTU - 3
 #elif defined(ARCH_NRF52)
     BLEService* bitchatService = nullptr;
     BLECharacteristic* bitchatCharacteristic = nullptr;
@@ -264,9 +326,9 @@ private:
     // Configuration
     bool bridgeEnabled = true;
     bool bleEnabled = true;
-    bool bleServiceSetup = false;  // Track if BLE service has been set up
-    uint32_t bleServiceSetupTime = 0;  // When BLE service was set up (for delayed Central scan)
-    static constexpr uint32_t CENTRAL_SCAN_DELAY_MS = 2000;  // Delay Central scan by 2 seconds (reduced for faster Android connection)
+    bool bleServiceSetup = false;
+    uint32_t nextBleSetupAttempt = 0;  // Backoff gate for retrying BLE service setup
+    static constexpr uint32_t BLE_SETUP_RETRY_MS = 3000;
     uint8_t maxHops = 8;
     uint32_t bleInterval = BITCHAT_BLE_INTERVAL_MS;
     
@@ -276,19 +338,41 @@ private:
     uint32_t duplicatesDropped = 0;
     
     // Peer identity - Meshtastic acts as a BitChat peer
-    uint32_t myBitChatPeerId = 0;      // Our BitChat peer ID (derived from Meshtastic node ID)
+    uint32_t myBitChatPeerId = 0;      // Low 32 bits of our BitChat peer ID (for logging only)
+    // Our 8-byte BitChat peer ID. MUST equal SHA256(noisePublicKey)[0..8]: iOS derives the
+    // expected senderID from the announced Noise key (PeerID(publicKey:)) and rejects the
+    // announce with .senderMismatch if the packet's senderID doesn't match. Set in
+    // initializeBitChatKeys() once the Noise key exists.
+    uint8_t myBitChatPeerId8[8] = {0};
     uint32_t lastAnnounceTime = 0;     // Last time we sent an announcement
-    static constexpr uint32_t ANNOUNCE_INTERVAL_MS = 30000; // Announce every 30 seconds
+    static constexpr uint32_t ANNOUNCE_INTERVAL_MS = 30000;
+    volatile bool announceRequested = false; // Set by BLE connect callback, serviced in runOnce()
+
+    // Alternating-UUID advertising. A 31-byte legacy BLE advertisement can't hold two
+    // 128-bit service UUIDs, so we can only put one in the *main* advertising packet at a
+    // time. iOS filters scans on the main packet only, so we periodically swap which UUID
+    // sits there (Meshtastic <-> BitChat). This lets both the Meshtastic app and the BitChat
+    // apps discover this node on iOS. See NimbleBluetooth/NRF52Bluetooth swapBitChatAdvertising().
+    uint32_t lastAdvAlternateTime = 0; // Last time we swapped the main-packet service UUID
+    static constexpr uint32_t ADV_ALTERNATE_INTERVAL_MS = 4000;
     
-    // Time synchronization from BLE peers
-    int64_t timeOffsetMs = 0;          // Offset to add to getTime() to get real Unix time
-    bool timeSynced = false;           // Whether we've synced time from a BLE peer
+    // Time synchronization.
+    // Preferred source is Meshtastic's own RTC (GPS/NTP/mesh/app). Only when the RTC has
+    // no valid time do we fall back to an absolute base learned from a BitChat peer's
+    // timestamp, advanced by millis() — avoids the double-count bug of adding an offset to
+    // a getTime() that later becomes valid.
+    bool haveSyncedBase = false;       // Whether a peer-derived absolute base was captured
+    uint64_t syncedUnixMs0 = 0;        // Peer Unix time (ms) captured at syncedAtMillis0
+    uint32_t syncedAtMillis0 = 0;      // millis() when syncedUnixMs0 was captured
     
-    // Ed25519 signing keys for BitChat announcements
-    // Using rweather/Crypto library: private key is 32 bytes, public key is 32 bytes
-    uint8_t ed25519SecretKey[32];      // Ed25519 private key (32 bytes for rweather/Crypto)
-    uint8_t ed25519PublicKey[32];     // Ed25519 public key (32 bytes)
-    bool ed25519KeysInitialized = false; // Track if keys have been generated/loaded
+    // BitChat identity keys, derived deterministically from Meshtastic's persisted
+    // random secret (config.security.private_key) via SHA256 with domain-separation tags.
+    // Real entropy, stable across reboots, no extra storage.
+    uint8_t ed25519SecretKey[32];      // Ed25519 private key seed (32 bytes for rweather/Crypto)
+    uint8_t ed25519PublicKey[32];      // Ed25519 signing public key
+    uint8_t noisePrivateKey[32];       // Noise static X25519 private key
+    uint8_t noisePublicKey[32];        // Noise static X25519 public key
+    bool ed25519KeysInitialized = false;
     
     // Rate-limiting for announcements relayed BLE->Mesh (per sender)
     // Only relay one announcement per sender every ANNOUNCE_RELAY_INTERVAL_MS
@@ -297,24 +381,16 @@ private:
         uint32_t lastRelayTime; // millis()
     };
     static constexpr size_t MAX_RATE_LIMIT_ENTRIES = 16;
-    static constexpr uint32_t ANNOUNCE_RELAY_INTERVAL_MS = 300000; // 5 minutes
+    static constexpr uint32_t ANNOUNCE_RELAY_INTERVAL_MS = 300000;
     AnnouncementRateEntry announceRateLimit[MAX_RATE_LIMIT_ENTRIES];
     size_t announceRateLimitCount = 0;
 
-    // Message queue for deferring heavy processing from BLE callbacks to main loop
-    // BLE callbacks have limited stack, so we queue messages and process them in runOnce()
-    // Use simple fixed-size circular buffer (no dynamic allocation, safe for early initialization)
-    // Allow a small burst of BLE messages without dropping them
-    struct QueuedMessage {
-        BitChatMessage msg;
-        bool fromBLE;
-    };
-    static constexpr size_t MAX_QUEUE_SIZE = 8;
-    QueuedMessage messageQueue[MAX_QUEUE_SIZE];
-    volatile size_t messageQueueHead = 0;  // Index of next message to process
-    volatile size_t messageQueueTail = 0;  // Index of next free slot
-    volatile size_t messageQueueCount = 0; // Number of messages in queue
-    
+    // Message queue for deferring heavy processing from BLE callbacks to the main loop.
+    // BLE callbacks have limited stack, so we queue messages and process them in runOnce().
+    // Single-producer (BLE callback task) / single-consumer (runOnce, main task) ring —
+    // race-free without a lock because each index is written by exactly one side.
+    BitChatMessageRing messageQueue;
+
 public:
     /** Constructor */
     BitChatBridgeModule();
@@ -355,6 +431,8 @@ public:
     
     // Peer announcement (public so BLE bridge can call on connection)
     void sendPeerAnnouncement();
+    // Request an announcement be sent from the main loop (safe to call from BLE callbacks)
+    void requestAnnouncement() { announceRequested = true; }
     
 private:
     // Internal helpers
@@ -367,8 +445,21 @@ private:
     BitChatMessage createPeerAnnouncement();
     
     // Ed25519 signing helpers
-    void initializeEd25519Keys();
+    void initializeBitChatKeys();
     bool signAnnouncement(BitChatMessage& msg);
+
+public:
+    // Pure helpers (public/static for unit testing) — no global/BLE state.
+    // out = SHA256(secret32 || domainTag)
+    static void deriveBitChatSeed(const uint8_t secret[32], const char* domainTag, uint8_t out[32]);
+    // Whether Meshtastic's RTC quality is good enough to use getTime() as authoritative.
+    static bool shouldAdoptRtc(RTCQuality quality) { return quality >= RTCQualityDevice; }
+    // Compute the timestamp (ms since epoch) to stamp on an outgoing announcement.
+    static uint64_t computeAnnounceTimestampMs(bool rtcValid, uint64_t rtcTimeMs,
+                                               bool haveSyncedBase, uint64_t syncedBaseMs,
+                                               uint32_t syncedAtMillis, uint32_t nowMillis);
+
+private:
     
     // Fragmentation helpers
     std::vector<BitChatMessage> fragmentMessage(const BitChatMessage& msg);
