@@ -39,6 +39,30 @@ void test_fragment_buffer_max_payload(void);
 void test_fragment_buffer_invalid_fragment_index(void);
 void test_fragment_buffer_multiple_concurrent_assemblies(void);
 
+// Forward declarations for duplicate cache 64-bit timestamp tests
+void test_duplicate_cache_high_bits_timestamp(void);
+void test_duplicate_cache_near_timestamps_distinct(void);
+
+// Forward declarations for message ring (SPSC queue) tests
+void test_ring_empty_on_init(void);
+void test_ring_fifo_order(void);
+void test_ring_full_drops_new(void);
+void test_ring_wraparound(void);
+
+// Forward declarations for time-sync helper tests
+void test_should_adopt_rtc(void);
+void test_announce_timestamp_prefers_rtc(void);
+void test_announce_timestamp_uses_synced_base_when_no_rtc(void);
+void test_announce_timestamp_no_double_count(void);
+void test_announce_timestamp_millis_wraparound(void);
+
+// Forward declarations for key derivation tests
+void test_derive_seed_deterministic(void);
+void test_derive_seed_domain_separation(void);
+void test_derive_seed_changes_with_secret(void);
+void test_ed25519_public_key_valid(void);
+void test_noise_public_key_valid_x25519(void);
+
 void setup()
 {
     // Wait for hardware (especially important for embedded)
@@ -78,7 +102,9 @@ void setup()
     RUN_TEST(test_duplicate_cache_hash_calculation);
     RUN_TEST(test_duplicate_cache_hash_different_payloads);
     RUN_TEST(test_duplicate_cache_empty_payload);
-    
+    RUN_TEST(test_duplicate_cache_high_bits_timestamp);
+    RUN_TEST(test_duplicate_cache_near_timestamps_distinct);
+
     // ========================================================================
     // Fragment Buffer Tests
     // ========================================================================
@@ -91,7 +117,33 @@ void setup()
     RUN_TEST(test_fragment_buffer_max_payload);
     RUN_TEST(test_fragment_buffer_invalid_fragment_index);
     RUN_TEST(test_fragment_buffer_multiple_concurrent_assemblies);
-    
+
+    // ========================================================================
+    // Message Ring (lock-free SPSC queue) Tests
+    // ========================================================================
+    RUN_TEST(test_ring_empty_on_init);
+    RUN_TEST(test_ring_fifo_order);
+    RUN_TEST(test_ring_full_drops_new);
+    RUN_TEST(test_ring_wraparound);
+
+    // ========================================================================
+    // Time-sync Helper Tests
+    // ========================================================================
+    RUN_TEST(test_should_adopt_rtc);
+    RUN_TEST(test_announce_timestamp_prefers_rtc);
+    RUN_TEST(test_announce_timestamp_uses_synced_base_when_no_rtc);
+    RUN_TEST(test_announce_timestamp_no_double_count);
+    RUN_TEST(test_announce_timestamp_millis_wraparound);
+
+    // ========================================================================
+    // Key Derivation Tests
+    // ========================================================================
+    RUN_TEST(test_derive_seed_deterministic);
+    RUN_TEST(test_derive_seed_domain_separation);
+    RUN_TEST(test_derive_seed_changes_with_secret);
+    RUN_TEST(test_ed25519_public_key_valid);
+    RUN_TEST(test_noise_public_key_valid_x25519);
+
     exit(UNITY_END());  // Stop unit testing and exit
 }
 

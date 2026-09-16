@@ -105,12 +105,17 @@ class NimbleBluetoothToRadioCallback : public NimBLECharacteristicCallbacks
 
         if (memcmp(lastToRadio, val.data(), val.length()) != 0) {
             if (bluetoothPhoneAPI->queue_size < 3) {
+                LOG_INFO("NimBLE: toRadio write %d bytes, queued (slot %d)", (int)val.length(), bluetoothPhoneAPI->queue_size);
                 memcpy(lastToRadio, val.data(), val.length());
                 std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
                 bluetoothPhoneAPI->nimble_queue.at(bluetoothPhoneAPI->queue_size) = val;
                 bluetoothPhoneAPI->queue_size++;
                 bluetoothPhoneAPI->setIntervalFromNow(0);
+            } else {
+                LOG_WARN("NimBLE: toRadio write %d bytes DROPPED - queue full", (int)val.length());
             }
+        } else {
+            LOG_WARN("NimBLE: toRadio write %d bytes DROPPED - duplicate of previous write", (int)val.length());
         }
     }
 };
@@ -124,6 +129,7 @@ class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
 #endif
     {
         int tries = 0;
+        LOG_INFO("NimBLE: fromRadio read request");
         bluetoothPhoneAPI->phoneWants = true;
         while (!bluetoothPhoneAPI->hasChecked && tries < 100) {
             bluetoothPhoneAPI->setIntervalFromNow(0);
@@ -132,6 +138,8 @@ class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
         }
         std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
         pCharacteristic->setValue(bluetoothPhoneAPI->fromRadioBytes, bluetoothPhoneAPI->numBytes);
+        LOG_INFO("NimBLE: fromRadio read served %d bytes after %d ms (hasChecked=%d)",
+                 (int)bluetoothPhoneAPI->numBytes, tries * 20, (int)bluetoothPhoneAPI->hasChecked);
 
         if (bluetoothPhoneAPI->numBytes != 0) // if we did send something, queue it up right away to reload
             bluetoothPhoneAPI->setIntervalFromNow(0);
@@ -342,6 +350,51 @@ int NimbleBluetooth::getRssi()
     return 0; // FIXME figure out where to source this
 }
 
+#ifndef NIMBLE_TWO
+// Passive GAP event listener (registered in setup() via setCustomGapHandler, which uses
+// ble_gap_event_listener_register - it observes events in ADDITION to the normal handlers).
+// Exists because the 1.4.x server callbacks don't expose connect status / disconnect reason /
+// encryption results, which are needed to diagnose phones that connect and immediately drop.
+// NimBLE host reasons are HCI code + 0x200: 0x213=remote user terminated, 0x208=supervision
+// timeout, 0x23d=MIC failure (stale bond), 0x205=authentication failure.
+static int gapEventLogger(struct ble_gap_event *event, void *arg)
+{
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT: {
+        struct ble_gap_conn_desc desc;
+        if (event->connect.status == 0 && ble_gap_conn_find(event->connect.conn_handle, &desc) == 0) {
+            LOG_INFO("NimBLE GAP: connect status=0 peer=%02x:%02x:%02x:%02x:%02x:%02x addrtype=%d",
+                     desc.peer_ota_addr.val[5], desc.peer_ota_addr.val[4], desc.peer_ota_addr.val[3],
+                     desc.peer_ota_addr.val[2], desc.peer_ota_addr.val[1], desc.peer_ota_addr.val[0],
+                     desc.peer_ota_addr.type);
+        } else {
+            LOG_INFO("NimBLE GAP: connect status=%d", event->connect.status);
+        }
+        break;
+    }
+    case BLE_GAP_EVENT_DISCONNECT:
+        LOG_INFO("NimBLE GAP: disconnect reason=0x%03x (%d)", event->disconnect.reason, event->disconnect.reason);
+        break;
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        LOG_INFO("NimBLE GAP: encryption change status=%d", event->enc_change.status);
+        break;
+    case BLE_GAP_EVENT_REPEAT_PAIRING:
+        LOG_INFO("NimBLE GAP: repeat pairing request (phone forgot bond but device still holds one)");
+        break;
+    case BLE_GAP_EVENT_MTU:
+        LOG_INFO("NimBLE GAP: MTU update value=%d", event->mtu.value);
+        break;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        LOG_INFO("NimBLE GAP: subscribe attr_handle=%d", event->subscribe.attr_handle);
+        break;
+    default:
+        LOG_DEBUG("NimBLE GAP: event type=%d", event->type);
+        break;
+    }
+    return 0;
+}
+#endif
+
 void NimbleBluetooth::setup()
 {
     // Uncomment for testing
@@ -376,6 +429,10 @@ void NimbleBluetooth::setup()
     LOG_DEBUG("NimBLE: Creating BLE server...");
     bleServer = NimBLEDevice::createServer();
     LOG_DEBUG("NimBLE: BLE server created");
+
+#ifndef NIMBLE_TWO
+    NimBLEDevice::setCustomGapHandler(gapEventLogger); // passive listener: log GAP connect/disconnect/enc events
+#endif
     
 #ifdef NIMBLE_TWO
     LOG_DEBUG("NimBLE: Creating server callbacks (NIMBLE_TWO path)...");
@@ -440,6 +497,9 @@ void NimbleBluetooth::setupService()
     FromRadioCharacteristic->setCallbacks(fromRadioCallbacks);
 
     bleService->start();
+    LOG_INFO("NimBLE: mesh service handles - toRadio=%d fromRadio=%d fromNum=%d logRadio=%d",
+             ToRadioCharacteristic->getHandle(), FromRadioCharacteristic->getHandle(),
+             fromNumCharacteristic->getHandle(), logRadioCharacteristic->getHandle());
 
     // Setup the battery service
     NimBLEService *batteryService = bleServer->createService(NimBLEUUID((uint16_t)0x180f)); // 0x180F is the Battery Service
@@ -456,6 +516,60 @@ void NimbleBluetooth::setupService()
 
     batteryService->start();
 }
+
+#ifndef NIMBLE_TWO
+// Build the legacy (31-byte) advertising and scan-response payloads for the current
+// alternation state. Shared by startAdvertising() (full reconfigure) and
+// swapBitChatAdvertising() (in-place data update while advertising stays running).
+void NimbleBluetooth::buildLegacyAdvertisingData(NimBLEAdvertisementData &advertisingData, NimBLEAdvertisementData &scanResponse)
+{
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    // For BitChat support, we need room in scan response for BitChat UUID (18 bytes)
+    // Use a shortened name to fit: ShortName(~8) + UUID(18) = ~26 bytes (fits in 31)
+    // Truncate prefix to 3 characters and preserve device ID (e.g., "Mes_17b8" from "Meshtastic_17b8")
+    const size_t bleShortNameLen = 8;
+    const char *fullName = getDeviceName();
+    size_t fullLen = strlen(fullName);
+    char shortName[bleShortNameLen + 1];
+
+    if (fullLen <= bleShortNameLen) {
+        strncpy(shortName, fullName, bleShortNameLen);
+        shortName[fullLen] = '\0';
+    } else {
+        strncpy(shortName, fullName, 3);
+        strncpy(shortName + 3, fullName + (fullLen - 5), 5);
+        shortName[bleShortNameLen] = '\0';
+    }
+
+    advertisingData.setName(shortName);
+    advertisingData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+
+    // Main advertising packet gets ONE 128-bit service UUID (two won't fit in 31 bytes).
+    // We alternate it (see swapBitChatAdvertising) because iOS filters scans on this packet only.
+    // Never advertise the BitChat UUID before its GATT service exists - fall back to
+    // Meshtastic-only so phones aren't pointed at a nonexistent service.
+    bool advBitChatMain = bitChatServiceReady && bitChatAdvMainIsBitChat;
+    advertisingData.setCompleteServices(NimBLEUUID(advBitChatMain ? BITCHAT_SERVICE_UUID : MESH_SERVICE_UUID));
+
+    // The OTHER 128-bit UUID goes in the scan response. iOS ignores scan-response UUIDs when
+    // filtering, but Android reads them, and the app whose UUID is in the main packet this
+    // cycle covers iOS. While the BitChat service isn't up, keep the scan response Meshtastic-only.
+    scanResponse.setName(shortName);
+    const char *scanRespUUID = bitChatServiceReady
+                                   ? (bitChatAdvMainIsBitChat ? MESH_SERVICE_UUID : BITCHAT_SERVICE_UUID)
+                                   : MESH_SERVICE_UUID;
+    scanResponse.setCompleteServices(NimBLEUUID(scanRespUUID));
+    LOG_DEBUG("NimBLE: Adv payloads built - main=%s UUID, scanrsp=%s UUID, name='%s'",
+              advBitChatMain ? "BitChat" : "Meshtastic",
+              (bitChatServiceReady && !bitChatAdvMainIsBitChat) ? "BitChat" : "Meshtastic", shortName);
+#else
+    advertisingData.setName(getDeviceName());
+    advertisingData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+    advertisingData.setCompleteServices(NimBLEUUID(MESH_SERVICE_UUID));
+    (void)scanResponse;
+#endif
+}
+#endif
 
 void NimbleBluetooth::startAdvertising()
 {
@@ -476,7 +590,16 @@ void NimbleBluetooth::startAdvertising()
     if (powerStatus->getHasBattery() == 1) {
         legacyAdvertising.setCompleteServices(NimBLEUUID((uint16_t)0x180f));
     }
+    #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    // Alternate which 128-bit UUID is in the main packet so both apps can discover us on iOS.
+    // But never advertise the BitChat UUID before its GATT service exists (setup may have
+    // failed / not run yet) - fall back to Meshtastic-only so we don't point phones at a
+    // service that isn't there.
+    legacyAdvertising.setCompleteServices(NimBLEUUID(
+        (bitChatServiceReady && bitChatAdvMainIsBitChat) ? BITCHAT_SERVICE_UUID : MESH_SERVICE_UUID));
+    #else
     legacyAdvertising.setCompleteServices(NimBLEUUID(MESH_SERVICE_UUID));
+    #endif
     legacyAdvertising.setMinInterval(500);
     legacyAdvertising.setMaxInterval(1000);
 
@@ -484,9 +607,16 @@ void NimbleBluetooth::startAdvertising()
     legacyScanResponse.setLegacyAdvertising(true);
     legacyScanResponse.setConnectable(true);
     legacyScanResponse.setName(getDeviceName());
-    
+
     #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-    legacyScanResponse.addServiceUUID(NimBLEUUID(BITCHAT_SERVICE_UUID));
+    // The other 128-bit UUID goes in the scan response (Android reads it there; iOS ignores it).
+    // Only advertise the BitChat UUID once its GATT service is up; otherwise keep the scan
+    // response Meshtastic-only.
+    if (bitChatServiceReady) {
+        legacyScanResponse.addServiceUUID(NimBLEUUID(bitChatAdvMainIsBitChat ? MESH_SERVICE_UUID : BITCHAT_SERVICE_UUID));
+    } else {
+        legacyScanResponse.addServiceUUID(NimBLEUUID(MESH_SERVICE_UUID));
+    }
     #endif
 
     if (!pAdvertising->setInstanceData(0, legacyAdvertising)) {
@@ -499,95 +629,28 @@ void NimbleBluetooth::startAdvertising()
 #else
     LOG_INFO("NimBLE: Starting advertising setup (old API path)");
     NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
-    LOG_DEBUG("NimBLE: Got advertising object");
-    
+
     // Note: We always reset and reconfigure advertising to ensure consistency
     // This matches nRF52 behavior where advertising is restarted on disconnect
-    LOG_DEBUG("NimBLE: Resetting advertising configuration...");
     pAdvertising->reset();
-    LOG_DEBUG("NimBLE: Reset complete, enabling scan response...");
     pAdvertising->setScanResponse(true);
-    LOG_DEBUG("NimBLE: Scan response enabled");
-    
-    // Match nRF52 pattern: Use shortened name in scan response to fit BitChat UUID
-    #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-    // For BitChat support, we need room in scan response for BitChat UUID (18 bytes)
-    // Temporarily use a shortened name to fit: ShortName(~8) + BitChatUUID(18) = ~26 bytes (fits in 31)
-    // Truncate prefix to 3 characters and preserve device ID (e.g., "Mes_17b8" from "Meshtastic_17b8")
-    const size_t bleShortNameLen = 8;
-    const char* fullName = getDeviceName();
-    size_t fullLen = strlen(fullName);
-    char shortName[bleShortNameLen + 1];
 
-    if (fullLen <= bleShortNameLen) {
-        strncpy(shortName, fullName, bleShortNameLen);
-        shortName[fullLen] = '\0';
-    } else {
-        strncpy(shortName, fullName, 3);
-        strncpy(shortName + 3, fullName + (fullLen - 5), 5);
-        shortName[bleShortNameLen] = '\0';
-    }
-    LOG_INFO("NimBLE: Using shortened BLE name '%s' (full: '%s') to fit BitChat UUID", shortName, fullName);
-    #else
-    const char* fullName = getDeviceName();
-    LOG_DEBUG("NimBLE: BitChat disabled, using full name '%s'", fullName);
-    #endif
-    
     // ESP32/NimBLE needs device name in MAIN advertising for discoverability in passive scanners (nRF Connect)
-    // Build advertising data explicitly with name + flags + service UUID
-    LOG_DEBUG("NimBLE: Creating main advertising data...");
+    // Build advertising data explicitly with name + flags + service UUID. The payloads
+    // (short name to fit a 128-bit UUID, alternating UUID placement) are built by the shared
+    // helper so swapBitChatAdvertising() produces identical packets when updating in place.
     NimBLEAdvertisementData advertisingData;
-    #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-    LOG_DEBUG("NimBLE: Setting short name '%s' in main advertising data", shortName);
-    advertisingData.setName(shortName); // Use short name to fit service UUIDs
-    LOG_INFO("NimBLE: Using shortened name '%s' in main advertising packet (required for passive scanner discovery)", shortName);
-    #else
-    LOG_DEBUG("NimBLE: Setting full name '%s' in main advertising data", fullName);
-    advertisingData.setName(fullName);
-    #endif
-    
-    LOG_DEBUG("NimBLE: Setting advertising flags (BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP)");
-    advertisingData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP); // General discoverable
-    
-    LOG_DEBUG("NimBLE: Adding Meshtastic service UUID to advertising data");
-    advertisingData.setCompleteServices(NimBLEUUID(MESH_SERVICE_UUID)); // Meshtastic service (128-bit) - primary
-    LOG_DEBUG("NimBLE: Meshtastic service UUID added");
-    
-    LOG_DEBUG("NimBLE: Applying advertising data to advertising object...");
+    NimBLEAdvertisementData scanResponse;
+    buildLegacyAdvertisingData(advertisingData, scanResponse);
     pAdvertising->setAdvertisementData(advertisingData);
-    LOG_DEBUG("NimBLE: Main advertising data applied successfully");
     // Note: Battery service UUID (0x180f) is omitted from advertising to save space
     // It's still available in GATT after connection - this matches how NIMBLE_TWO path works
-    LOG_DEBUG("NimBLE: Set main advertising packet with name, flags, and Meshtastic service UUID");
-    
-    // Add BitChat service UUID to SCAN RESPONSE if BitChat module is enabled
-    // This matches the nRF52 pattern where BitChat UUID goes in scan response
     #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-    LOG_DEBUG("NimBLE: Creating scan response data with BitChat UUID...");
-    // Create scan response data with shortened name + BitChat UUID
-    // This matches nRF52: scan response has ShortName + BitChat UUID
-    // nRF52: Bluefruit.ScanResponse.addName() + Bluefruit.ScanResponse.addUuid(BITCHAT_UUID)
-    NimBLEAdvertisementData scanResponse;
-    LOG_DEBUG("NimBLE: Setting short name '%s' in scan response", shortName);
-    scanResponse.setName(shortName); // Shortened name in scan response (matches nRF52 pattern)
-    LOG_DEBUG("NimBLE: Adding BitChat service UUID to scan response");
-    scanResponse.setCompleteServices(NimBLEUUID(BITCHAT_SERVICE_UUID));
-    LOG_DEBUG("NimBLE: Applying scan response data...");
     pAdvertising->setScanResponseData(scanResponse);
-    LOG_INFO("NimBLE: Set scan response with shortened name '%s' and BitChat UUID (matches nRF52 pattern)", shortName);
-    #else
-    LOG_DEBUG("NimBLE: BitChat disabled, skipping scan response setup");
     #endif
-    
-    // Restore full device name (for GATT Device Name characteristic 0x2A00)
-    // This matches nRF52: Bluefruit.setName(fullName) after advertising is configured
-    // The advertising/scan response still uses shortened name, but GATT Device Name will be full name
-    #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-    // Note: NimBLEDevice::init() already set the full name, so GATT Device Name is correct
-    // We don't need to change it - the advertising packet just uses short name to fit UUIDs
-    LOG_DEBUG("NimBLE: GATT Device Name already set to full name '%s' via NimBLEDevice::init()", fullName);
-    #endif
-    
+    // GATT Device Name (0x2A00) keeps the full name set by NimBLEDevice::init();
+    // only the advertising packets use the shortened name.
+
     // Set advertising parameters (matching nRF52 behavior)
     LOG_DEBUG("NimBLE: Setting advertising intervals (min=32*0.625ms=20ms, max=244*0.625ms=152.5ms)");
     pAdvertising->setMinInterval(32); // 32 * 0.625ms = 20ms (fast mode)
@@ -595,9 +658,8 @@ void NimbleBluetooth::startAdvertising()
     LOG_DEBUG("NimBLE: Advertising intervals set");
     
     // Try to start advertising (0 = advertise forever, matches nRF52)
-    LOG_INFO("NimBLE: Starting BLE advertising (Meshtastic service in main adv, ShortName + BitChat UUID in scan response - matches nRF52)");
-    LOG_DEBUG("NimBLE: Calling pAdvertising->start(0) to advertise forever...");
-    
+    LOG_INFO("NimBLE: Starting BLE advertising (alternating UUID placement - see buildLegacyAdvertisingData)");
+
     bool started = pAdvertising->start(0);
     LOG_DEBUG("NimBLE: pAdvertising->start(0) returned: %s", started ? "true" : "false");
     
@@ -605,44 +667,13 @@ void NimbleBluetooth::startAdvertising()
     delay(100);
     
     if (started) {
-        LOG_INFO("NimBLE: BLE advertising started successfully - device should be discoverable as '%s'", 
-                 #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-                 shortName
-                 #else
-                 fullName
-                 #endif
-                 );
-        LOG_INFO("NimBLE: Main advertising packet contains: name='%s', Meshtastic UUID", 
-                 #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-                 shortName
-                 #else
-                 fullName
-                 #endif
-                 );
-        #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-        LOG_INFO("NimBLE: Scan response packet contains: name='%s', BitChat UUID", shortName);
-        #endif
-        LOG_DEBUG("NimBLE: Advertising intervals: min=%d*0.625ms=%dms, max=%d*0.625ms=%dms", 
-                  32, 32*625/1000, 244, 244*625/1000);
-        
-        // Verify advertising is actually active (for old API, this may not be available)
-        // Note: pAdvertising->start(0) with 0 = advertise forever, but NimBLE may stop when connected
-        LOG_INFO("NimBLE: Advertising configured with start(0) = advertise forever (until connected)");
-        LOG_INFO("NimBLE: When disconnected, advertising will be restarted via onDisconnect callback");
+        LOG_INFO("NimBLE: BLE advertising started successfully");
+        // Note: pAdvertising->start(0) with 0 = advertise forever, but NimBLE stops when connected;
+        // advertising is restarted via the onDisconnect callback.
     } else {
         LOG_ERROR("NimBLE: BLE advertising FAILED to start!");
         LOG_ERROR("NimBLE: This means the device will NOT be discoverable!");
         LOG_ERROR("NimBLE: Check advertising data size limits (31 bytes for main, 31 bytes for scan response)");
-        LOG_ERROR("NimBLE: Main adv: name='%s' + flags + Meshtastic UUID (128-bit)", 
-                 #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-                 shortName
-                 #else
-                 fullName
-                 #endif
-                 );
-        #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-        LOG_ERROR("NimBLE: Scan resp: name='%s' + BitChat UUID (128-bit)", shortName);
-        #endif
     }
 #endif
 }
@@ -650,10 +681,66 @@ void NimbleBluetooth::startAdvertising()
 void NimbleBluetooth::setBitChatServiceReady()
 {
 #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    bitChatServiceReady = true; // GATT service now exists -> safe to advertise its UUID
     if (bitChatAdvertisingDeferred) {
         bitChatAdvertisingDeferred = false;
         LOG_INFO("NimBLE: BitChat service ready, advertising can start");
     }
+#endif
+}
+
+// Bring up plain Meshtastic advertising when the BitChat GATT service could NOT be set up.
+// Clears the boot-time deferral so the device stays discoverable as a Meshtastic node, but
+// leaves bitChatServiceReady false so startAdvertising() omits the BitChat UUID entirely -
+// we must never advertise a service that doesn't exist in the GATT table.
+void NimbleBluetooth::startBaseAdvertising()
+{
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    bitChatAdvertisingDeferred = false;
+    startAdvertising();
+#endif
+}
+
+// Flip which 128-bit service UUID sits in the main advertising packet.
+// Called on a timer (~ADV_ALTERNATE_INTERVAL_MS) from BitChatBridgeModule::runOnce().
+// On the old API this updates the advertising/scan-response data IN PLACE while advertising
+// keeps running (HCI LE Set Advertising Data is legal while enabled). Advertising must never
+// be stopped/reset here: isConnected() cannot see a phone whose connection is still being
+// established, and a timer-driven teardown in that window kills the attempt (Android GATT 133).
+void NimbleBluetooth::swapBitChatAdvertising()
+{
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    if (isDeInit || !bleServer) {
+        return; // BLE not up
+    }
+    if (bitChatAdvertisingDeferred) {
+        return; // BitChat service not ready yet - not advertising the BitChat UUID at all
+    }
+    if (isConnected()) {
+        return; // Connected: NimBLE isn't advertising; don't disturb the link
+    }
+    bitChatAdvMainIsBitChat = !bitChatAdvMainIsBitChat;
+    LOG_DEBUG("NimBLE: Alternating advertising - main packet now carries %s UUID",
+              bitChatAdvMainIsBitChat ? "BitChat" : "Meshtastic");
+#ifdef NIMBLE_TWO
+    startAdvertising(); // ext-adv API (esp32c6 only): full reconfigure, as before
+#else
+    NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+    if (!pAdvertising) {
+        return;
+    }
+    // Set the swapped payloads unconditionally - the HCI Set Advertising/Scan Response Data
+    // commands are legal whether or not advertising is currently enabled, and this keeps the
+    // on-air data in sync with the flag even if ensureAdvertising() later resumes advertising.
+    // NEVER start/stop/reset advertising here: !isAdvertising() does not mean idle - it is
+    // also the window where a CONNECT_IND just arrived and the host hasn't processed the
+    // connect event yet. Resuming advertising is ensureAdvertising()/onDisconnect's job.
+    NimBLEAdvertisementData advertisingData;
+    NimBLEAdvertisementData scanResponse;
+    buildLegacyAdvertisingData(advertisingData, scanResponse);
+    pAdvertising->setAdvertisementData(advertisingData);
+    pAdvertising->setScanResponseData(scanResponse);
+#endif
 #endif
 }
 
@@ -678,42 +765,41 @@ void NimbleBluetooth::clearBonds()
 
 void NimbleBluetooth::ensureAdvertising()
 {
-    // Ensure advertising is active when not connected (matches nRF52's restartOnDisconnect behavior)
+    // Safety net: make sure advertising is running when not connected. This runs
+    // periodically, so it MUST be cheap and idempotent. Crucially it must NOT reset or
+    // reconfigure advertising when it's already active - doing that on a timer can tear
+    // down an in-progress connection attempt from a phone (the root cause of flaky
+    // ESP32 connections). Full (re)configuration only happens in startAdvertising(),
+    // which is called on setup and on disconnect.
     if (isDeInit) {
         return; // BLE is deinitialized, don't try to advertise
     }
-    
     if (!bleServer) {
         return; // Server not initialized
     }
-    
-    // If we're connected, advertising should be stopped (standard BLE behavior)
-    // We only ensure advertising when NOT connected
     if (isConnected()) {
-        LOG_DEBUG("NimBLE: ensureAdvertising() - device is connected, advertising should be stopped");
+        // Connected -> advertising is expected to be stopped by the stack; leave it alone.
         return;
     }
-    
-    // When not connected, advertising should be active
-    // For old API, we can't easily check if advertising is active, so we just restart it
-    // This ensures advertising continues even if it stopped for some reason
-    LOG_DEBUG("NimBLE: ensureAdvertising() - device not connected, ensuring advertising is active");
-    
-    // Get advertising object and check if we need to restart
+
     NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
     if (!pAdvertising) {
         LOG_ERROR("NimBLE: ensureAdvertising() - cannot get advertising object!");
         return;
     }
-    
-        // Restart advertising to ensure it's active
-        // Note: startAdvertising() resets and reconfigures advertising, which is safe
-        // This ensures advertising continues even if it stopped for any reason
-        LOG_DEBUG("NimBLE: ensureAdvertising() - restarting advertising to ensure it's active");
+
+    if (pAdvertising->isAdvertising()) {
+        return; // Already advertising - nothing to do (no reset storm)
+    }
+
+    // Advertising is off while disconnected: resume it WITHOUT reconfiguring. The
+    // advertising/scan-response data was already set by the last startAdvertising().
+    LOG_DEBUG("NimBLE: ensureAdvertising() - advertising was off, resuming (lightweight start)");
+    if (!pAdvertising->start(0)) {
+        // Bare resume failed (e.g. never configured yet) - fall back to a full setup.
+        LOG_WARN("NimBLE: ensureAdvertising() - bare start failed, doing full reconfigure");
         startAdvertising();
-        
-        // Log that we've ensured advertising
-        LOG_DEBUG("NimBLE: ensureAdvertising() - advertising restart complete");
+    }
 }
 
 void NimbleBluetooth::sendLog(const uint8_t *logMessage, size_t length)

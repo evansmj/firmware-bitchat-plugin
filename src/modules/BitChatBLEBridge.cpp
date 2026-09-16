@@ -85,6 +85,13 @@ extern "C" {
 // Global pointer to the active bridge instance for callbacks
 static BitChatBLEBridge* activeBridge = nullptr;
 
+// Handle of the current BitChat peripheral connection. Used to look up the connection's
+// negotiated ATT MTU (Attribute Protocol Maximum Transmission Unit): the largest ATT PDU
+// the phone and SoftDevice agreed to exchange on this link. Default is 23 bytes; after
+// MTU exchange it is typically up to 247 with BANDWIDTH_MAX. Usable notify payload is
+// MTU - 3 (ATT notification opcode + handle). BLE_CONN_HANDLE_INVALID (0xFFFF) = no connection.
+static uint16_t g_bitchatConnHandle = BLE_CONN_HANDLE_INVALID;
+
 // Callback functions for nRF52 Bluefruit
 void bitchat_characteristic_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len)
 {
@@ -106,9 +113,26 @@ void bitchat_cccd_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint
 
 size_t BitChatBLEBridge::getPeripheralNotificationLimit()
 {
-    // Original Meshtastic uses BANDWIDTH_MAX which gives 247-byte MTU
-    // Usable payload = 247 - 3 (ATT header) = 244 bytes
-    return 244;
+    // Usable notify payload = negotiated ATT MTU - 3 (ATT notification header).
+    // Query the live connection so we track whatever the phone negotiated (BANDWIDTH_MAX
+    // allows up to 247). Fall back to the conservative default if unavailable.
+    //
+    // Right after connect, the MTU exchange usually hasn't finished yet, so
+    // getMtu() still reports the 23-byte ATT default (usable payload 20). requestAnnouncement()
+    // fires from the connect callback, so a ~170-byte signed announce sent in that window
+    // would be dropped. Treat the default MTU (<= 23) as "not negotiated yet" and assume the
+    // large payload the phone almost certainly negotiates (BANDWIDTH_MAX). A phone that truly
+    // stays at MTU 23 can't receive an announce over notify regardless, so this is safe.
+    if (g_bitchatConnHandle != BLE_CONN_HANDLE_INVALID) {
+        BLEConnection* conn = Bluefruit.Connection(g_bitchatConnHandle);
+        if (conn) {
+            uint16_t mtu = conn->getMtu();
+            if (mtu > BLE_GATT_ATT_MTU_DEFAULT) { 
+                return static_cast<size_t>(mtu) - 3;
+            }
+        }
+    }
+    return 244; // default / not-yet-negotiated: assume 247-byte MTU - 3
 }
 
 extern void onConnect(uint16_t conn_handle);
@@ -117,8 +141,9 @@ extern void onDisconnect(uint16_t conn_handle, uint8_t reason);
 void bitchat_connect_callback(uint16_t conn_handle)
 {
     onConnect(conn_handle);
+    g_bitchatConnHandle = conn_handle;
     LOG_INFO("BitChat BLE: Peripheral connection established (handle=%d)", conn_handle);
-    
+
     if (activeBridge) {
         activeBridge->onBitChatConnect();
     }
@@ -127,7 +152,10 @@ void bitchat_connect_callback(uint16_t conn_handle)
 void bitchat_disconnect_callback(uint16_t conn_handle, uint8_t reason)
 {
     onDisconnect(conn_handle, reason);
-    
+    if (conn_handle == g_bitchatConnHandle) {
+        g_bitchatConnHandle = BLE_CONN_HANDLE_INVALID;
+    }
+
     if (activeBridge) {
         activeBridge->handleBitChatDisconnect(conn_handle, reason);
     } else {
@@ -222,8 +250,10 @@ bool BitChatBLEBridge::setupBitChatService(NimBLEServer* server)
     }
     
     std::lock_guard<std::mutex> lock(bleMutex);
-    
+
     try {
+        bitchatServer = server;
+
         // Create BitChat service
         bitchatService = server->createService(NimBLEUUID(BITCHAT_SERVICE_UUID));
         if (!bitchatService) {
@@ -265,6 +295,29 @@ bool BitChatBLEBridge::setupBitChatService(NimBLEServer* server)
         LOG_ERROR("BitChat BLE: Exception during service setup: %s", e.what());
         return false;
     }
+}
+
+size_t BitChatBLEBridge::getPeripheralNotificationLimit()
+{
+    // Usable notify payload = negotiated ATT MTU - 3 (ATT notification header). Use the
+    // smallest MTU across connected centrals so a notify never exceeds any peer's limit.
+    // Fall back to the conservative 244 (247-MTU) if the MTU isn't known / not yet negotiated;
+    // NimBLE reports the 23-byte default until the exchange completes, and a notify larger than
+    // the real MTU is silently truncated, so treat <= 23 as "not negotiated yet".
+    size_t limit = 244;
+    if (bitchatServer) {
+        size_t count = bitchatServer->getConnectedCount();
+        for (size_t i = 0; i < count; i++) {
+            uint16_t mtu = bitchatServer->getPeerMTU(bitchatServer->getPeerInfo(i).getConnHandle());
+            if (mtu > 23) {
+                size_t peerLimit = static_cast<size_t>(mtu) - 3;
+                if (peerLimit < limit) {
+                    limit = peerLimit;
+                }
+            }
+        }
+    }
+    return limit;
 }
 
 #elif defined(ARCH_NRF52)
@@ -372,8 +425,10 @@ void BitChatBLEBridge::broadcastMessage(const BitChatMessage& msg)
         return;
     }
     
-    // Serialize BitChat message once
-    uint8_t buffer[BITCHAT_HEADER_SIZE + BITCHAT_MAX_PAYLOAD_SIZE];
+    // Serialize BitChat message once. Size for the largest possible message - header + sender
+    // + recipient + max payload + signature - not just header+payload, or a large signed relay
+    // (recipient + 64-byte signature) would fail to serialize.
+    uint8_t buffer[BITCHAT_MAX_MESSAGE_SIZE];
     size_t messageSize = BitChatProtocolHandler::serializeMessage(msg, buffer, sizeof(buffer));
     
     if (messageSize == 0) {
@@ -389,11 +444,21 @@ void BitChatBLEBridge::broadcastMessage(const BitChatMessage& msg)
             LOG_WARN("BitChat BLE: Cannot broadcast - characteristic not initialized");
             return;
         }
-                // Set characteristic value and notify (Peripheral role - to connected centrals)
+
+        // A notify larger than the negotiated ATT MTU - 3 is silently truncated by the stack,
+        // which would corrupt the message on the phone. There's no BLE central fallback and we
+        // don't BLE-fragment to the phone, so drop it (mirrors the nRF52 guard).
+        size_t peripheralLimit = getPeripheralNotificationLimit();
+        if (messageSize > peripheralLimit) {
+            LOG_WARN("BitChat BLE: Message %d bytes exceeds notify limit %zu (MTU-3), dropping", messageSize, peripheralLimit);
+            return;
+        }
+
+        // Set characteristic value and notify (Peripheral role - to connected centrals)
         // This ensures the announcement is available even if the client doesn't subscribe to notifications
         bitchatCharacteristic->setValue(buffer, messageSize);
         bitchatCharacteristic->notify();
-        
+
         LOG_DEBUG("BitChat BLE: ESP32 broadcasted message type=0x%02x, %d bytes (set value + notify)", msg.type, messageSize);
         
     } catch (const std::exception& e) {
@@ -401,29 +466,23 @@ void BitChatBLEBridge::broadcastMessage(const BitChatMessage& msg)
     }
     
 #elif defined(ARCH_NRF52)
-    // Broadcast on ALL links (like iOS and Android do):
-    // 1. Peripheral role: notify subscribed centrals (devices connected to us)
-    // 2. Central role: write to connected peripherals (devices we're connected to)
-    
-    // 1. Send via Peripheral role (notify subscribed centrals)
+    // The node is a BLE peripheral only (the phone is always the central; node-to-node
+    // hops go over LoRa). So we deliver to the phone via a Peripheral notify.
     if (!bitchatCharacteristic) {
         LOG_WARN("BitChat BLE: Cannot broadcast - characteristic not initialized");
         return;
     }
 
-    // BLE notifications are limited by MTU (MTU - 3 bytes for ATT header)
+    // Notifications are limited to the negotiated ATT MTU minus the 3-byte ATT header.
     size_t peripheralLimit = getPeripheralNotificationLimit();
-    
+
     if (messageSize > peripheralLimit) {
-        // Message is too large for a single notification
-        // Skip notification and send via Central write instead
-        // Android should buffer Central writes, allowing large messages to be received
-        LOG_WARN("BitChat BLE: Message %d bytes > %zu (peripheral MTU payload limit), skipping notify",
+        // Too large for a single notification. There is no BLE central path to fall back
+        // to, and we don't do BLE-layer fragmentation to the phone, so this is dropped.
+        // (BitChat-level fragmentation is applied on the LoRa/mesh direction only.)
+        LOG_WARN("BitChat BLE: Message %d bytes exceeds notify limit %zu (MTU-3), dropping",
                  messageSize, peripheralLimit);
-        LOG_WARN("BitChat BLE: Android should receive this via Central write (if connected)");
-        // Don't send via notify - let Central write handle it below
     } else {
-        // Message fits in single notification - send directly
         bitchatCharacteristic->write(buffer, messageSize);
         bool notifyResult = bitchatCharacteristic->notify(buffer, messageSize);
         if (notifyResult) {
@@ -432,7 +491,7 @@ void BitChatBLEBridge::broadcastMessage(const BitChatMessage& msg)
             LOG_DEBUG("BitChat BLE: notify() returned false (client may not have enabled notifications yet), %d bytes", messageSize);
         }
     }
-    
+
 #endif
 
 #ifdef ARCH_NRF52
@@ -466,17 +525,17 @@ void BitChatBLEBridge::onBitChatWrite(const uint8_t* data, size_t length)
     if (BitChatProtocolHandler::parseMessage(data, length, msg)) {
         // Success! Complete message received in one write
         writeBufferOffset = 0;
-        
+
         // Validate message
         if (!BitChatProtocolHandler::validateMessage(msg)) {
             LOG_WARN("BitChat BLE: Invalid message received via BLE (type=0x%02x)", msg.type);
             // Message was parsed but invalid - just drop it
             return;
         }
-        
-        // Forward to bridge module for processing
+
+        // Queue for deferred processing in the main loop.  BLE callbacks run with a limited stack.
         if (bitchatBridgeModule) {
-            bitchatBridgeModule->processBitChatMessage(msg, true); // fromBLE = true
+            bitchatBridgeModule->queueMessageForProcessing(msg, true); // fromBLE = true
         }
         return;
     }
@@ -554,9 +613,11 @@ void BitChatBLEBridge::handleBitChatDisconnect(uint16_t connHandle, uint8_t reas
 
 void BitChatBLEBridge::onBitChatConnect()
 {
-    // Send an immediate announcement via Peripheral notify when Android/iOS connects
+    // Request an announcement from the main loop rather than sending it here.
+    // sendPeerAnnouncement() does Ed25519 signing, which is too heavy for the limited
+    // BLE callback stack (especially ESP32/NimBLE software crypto).
     if (bridgeModule) {
-        bridgeModule->sendPeerAnnouncement();
+        bridgeModule->requestAnnouncement();
     }
 }
 

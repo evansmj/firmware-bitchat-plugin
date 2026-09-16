@@ -10,6 +10,7 @@ class NRF52Bluetooth : BluetoothApi
     void shutdown();
     void startDisabled();
     void resumeAdvertising();
+    void swapBitChatAdvertising(); // Alternate which service UUID sits in the main advertising packet
     void clearBonds();
     bool isConnected();
     int getRssi();

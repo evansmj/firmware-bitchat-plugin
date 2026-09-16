@@ -11,7 +11,7 @@ void test_duplicate_cache_first_message(void) {
     
     BitChatMessage msg;
     msg.type = BITCHAT_MSG_MESSAGE;
-    msg.senderId = 0x12345678;
+    msg.setSenderId32(0x12345678);
     msg.timestamp = 1234567890;
     msg.payloadLength = 5;
     memcpy(msg.payload, "test", 5);
@@ -26,7 +26,7 @@ void test_duplicate_cache_add_and_detect(void) {
     
     BitChatMessage msg;
     msg.type = BITCHAT_MSG_MESSAGE;
-    msg.senderId = 0x12345678;
+    msg.setSenderId32(0x12345678);
     msg.timestamp = 1234567890;
     msg.payloadLength = 11;
     memcpy(msg.payload, "Hello World", 11);
@@ -46,14 +46,14 @@ void test_duplicate_cache_different_messages(void) {
     
     BitChatMessage msg1;
     msg1.type = BITCHAT_MSG_MESSAGE;
-    msg1.senderId = 0x12345678;
+    msg1.setSenderId32(0x12345678);
     msg1.timestamp = 1234567890;
     msg1.payloadLength = 5;
     memcpy(msg1.payload, "msg1", 5);
     
     BitChatMessage msg2;
     msg2.type = BITCHAT_MSG_MESSAGE;
-    msg2.senderId = 0x87654321;
+    msg2.setSenderId32(0x87654321);
     msg2.timestamp = 1234567891;
     msg2.payloadLength = 5;
     memcpy(msg2.payload, "msg2", 5);
@@ -79,14 +79,14 @@ void test_duplicate_cache_same_sender_different_timestamp(void) {
     
     BitChatMessage msg1;
     msg1.type = BITCHAT_MSG_MESSAGE;
-    msg1.senderId = 0x12345678;
+    msg1.setSenderId32(0x12345678);
     msg1.timestamp = 1234567890;
     msg1.payloadLength = 5;
     memcpy(msg1.payload, "test", 5);
     
     BitChatMessage msg2;
     msg2.type = BITCHAT_MSG_MESSAGE;
-    msg2.senderId = 0x12345678;
+    msg2.setSenderId32(0x12345678);
     msg2.timestamp = 1234567891;  // Different timestamp
     msg2.payloadLength = 5;
     memcpy(msg2.payload, "test", 5);
@@ -102,14 +102,14 @@ void test_duplicate_cache_same_content_different_sender(void) {
     
     BitChatMessage msg1;
     msg1.type = BITCHAT_MSG_MESSAGE;
-    msg1.senderId = 0x12345678;
+    msg1.setSenderId32(0x12345678);
     msg1.timestamp = 1234567890;
     msg1.payloadLength = 5;
     memcpy(msg1.payload, "test", 5);
     
     BitChatMessage msg2;
     msg2.type = BITCHAT_MSG_MESSAGE;
-    msg2.senderId = 0x87654321;  // Different sender
+    msg2.setSenderId32(0x87654321);  // Different sender
     msg2.timestamp = 1234567890;
     msg2.payloadLength = 5;
     memcpy(msg2.payload, "test", 5);
@@ -125,14 +125,14 @@ void test_duplicate_cache_different_message_types(void) {
     
     BitChatMessage msg1;
     msg1.type = BITCHAT_MSG_ANNOUNCE;
-    msg1.senderId = 0x12345678;
+    msg1.setSenderId32(0x12345678);
     msg1.timestamp = 1234567890;
     msg1.payloadLength = 5;
     memcpy(msg1.payload, "test", 5);
     
     BitChatMessage msg2;
     msg2.type = BITCHAT_MSG_MESSAGE;  // Different type
-    msg2.senderId = 0x12345678;
+    msg2.setSenderId32(0x12345678);
     msg2.timestamp = 1234567890;
     msg2.payloadLength = 5;
     memcpy(msg2.payload, "test", 5);
@@ -150,7 +150,7 @@ void test_duplicate_cache_overflow(void) {
     for (int i = 0; i < BITCHAT_DUPLICATE_CACHE_SIZE + 10; i++) {
         BitChatMessage msg;
         msg.type = BITCHAT_MSG_MESSAGE;
-        msg.senderId = 0x10000000 + i;
+        msg.setSenderId32(0x10000000 + i);
         msg.timestamp = 1234567890 + i;
         msg.payloadLength = 5;
         memcpy(msg.payload, "test", 5);
@@ -161,7 +161,7 @@ void test_duplicate_cache_overflow(void) {
     // The first message should have been evicted (circular buffer)
     BitChatMessage firstMsg;
     firstMsg.type = BITCHAT_MSG_MESSAGE;
-    firstMsg.senderId = 0x10000000;
+    firstMsg.setSenderId32(0x10000000);
     firstMsg.timestamp = 1234567890;
     firstMsg.payloadLength = 5;
     memcpy(firstMsg.payload, "test", 5);
@@ -172,7 +172,7 @@ void test_duplicate_cache_overflow(void) {
     // But recent messages should still be there
     BitChatMessage recentMsg;
     recentMsg.type = BITCHAT_MSG_MESSAGE;
-    recentMsg.senderId = 0x10000000 + BITCHAT_DUPLICATE_CACHE_SIZE + 9;
+    recentMsg.setSenderId32(0x10000000 + BITCHAT_DUPLICATE_CACHE_SIZE + 9);
     recentMsg.timestamp = 1234567890 + BITCHAT_DUPLICATE_CACHE_SIZE + 9;
     recentMsg.payloadLength = 5;
     memcpy(recentMsg.payload, "test", 5);
@@ -185,14 +185,14 @@ void test_duplicate_cache_hash_calculation(void) {
     
     BitChatMessage msg1;
     msg1.type = BITCHAT_MSG_MESSAGE;
-    msg1.senderId = 0x12345678;
+    msg1.setSenderId32(0x12345678);
     msg1.timestamp = 1234567890;
     msg1.payloadLength = 11;
     memcpy(msg1.payload, "Hello World", 11);
     
     BitChatMessage msg2;
     msg2.type = BITCHAT_MSG_MESSAGE;
-    msg2.senderId = 0x12345678;
+    msg2.setSenderId32(0x12345678);
     msg2.timestamp = 1234567890;
     msg2.payloadLength = 11;
     memcpy(msg2.payload, "Hello World", 11);
@@ -210,14 +210,14 @@ void test_duplicate_cache_hash_different_payloads(void) {
     
     BitChatMessage msg1;
     msg1.type = BITCHAT_MSG_MESSAGE;
-    msg1.senderId = 0x12345678;
+    msg1.setSenderId32(0x12345678);
     msg1.timestamp = 1234567890;
     msg1.payloadLength = 11;
     memcpy(msg1.payload, "Hello World", 11);
     
     BitChatMessage msg2;
     msg2.type = BITCHAT_MSG_MESSAGE;
-    msg2.senderId = 0x12345678;
+    msg2.setSenderId32(0x12345678);
     msg2.timestamp = 1234567890;
     msg2.payloadLength = 12;
     memcpy(msg2.payload, "Hello World!", 12);
@@ -232,17 +232,59 @@ void test_duplicate_cache_hash_different_payloads(void) {
 
 void test_duplicate_cache_empty_payload(void) {
     BitChatDuplicateCache cache;
-    
+
     BitChatMessage msg;
     msg.type = BITCHAT_MSG_PING;
-    msg.senderId = 0x12345678;
+    msg.setSenderId32(0x12345678);
     msg.timestamp = 1234567890;
     msg.payloadLength = 0;
-    
+
     // Should handle empty payload without crashing
     TEST_ASSERT_FALSE(cache.isDuplicate(msg));
     cache.addMessage(msg);
     TEST_ASSERT_TRUE(cache.isDuplicate(msg));
+}
+
+// Two messages whose timestamps differ ONLY in the high 32 bits (same low 32 bits).
+// The old cache truncated the timestamp to 32 bits and would wrongly treat these as the
+// same message. With the full 64-bit timestamp they must be distinct.
+void test_duplicate_cache_high_bits_timestamp(void) {
+    BitChatDuplicateCache cache;
+
+    BitChatMessage msg1;
+    msg1.type = BITCHAT_MSG_MESSAGE;
+    msg1.setSenderId32(0x12345678);
+    msg1.timestamp = 0x0000000100000005ULL; // low32 = 0x00000005
+    msg1.payloadLength = 4;
+    memcpy(msg1.payload, "abc", 4);
+
+    BitChatMessage msg2 = msg1;
+    msg2.timestamp = 0x0000000200000005ULL; // same low32, different high32
+
+    cache.addMessage(msg1);
+    TEST_ASSERT_TRUE(cache.isDuplicate(msg1));   // exact same message
+    TEST_ASSERT_FALSE(cache.isDuplicate(msg2));  // differs in high timestamp bits
+}
+
+// With the fuzzy ±5 "near-duplicate" window removed, two messages a few ms apart are
+// treated as distinct (exact-match dedup on the full fingerprint).
+void test_duplicate_cache_near_timestamps_distinct(void) {
+    BitChatDuplicateCache cache;
+
+    BitChatMessage msg1;
+    msg1.type = BITCHAT_MSG_MESSAGE;
+    msg1.setSenderId32(0x12345678);
+    msg1.timestamp = 1700000000000ULL;
+    msg1.payloadLength = 5;
+    memcpy(msg1.payload, "same", 5);
+
+    BitChatMessage msg2 = msg1;
+    msg2.timestamp = 1700000000003ULL; // 3 ms later, same content
+
+    cache.addMessage(msg1);
+    TEST_ASSERT_FALSE(cache.isDuplicate(msg2)); // not a duplicate anymore
+    cache.addMessage(msg2);
+    TEST_ASSERT_TRUE(cache.isDuplicate(msg2));  // exact retransmit is a duplicate
 }
 
 

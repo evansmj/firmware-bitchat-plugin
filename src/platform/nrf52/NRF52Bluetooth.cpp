@@ -29,6 +29,15 @@ static uint8_t toRadioBytes[meshtastic_ToRadio_size];
 
 static uint16_t connectionHandle;
 
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+// Alternating-UUID advertising toggle (see startAdv / NRF52Bluetooth::swapBitChatAdvertising).
+// A 31-byte legacy advertisement holds only one 128-bit UUID; iOS filters scans on the main
+// packet only, so we periodically swap which UUID lives there.
+// false: Meshtastic UUID in main packet, BitChat UUID in scan response.
+// true:  BitChat UUID in main packet, Meshtastic UUID in scan response.
+static bool bitchatAdvMainIsBitChat = false;
+#endif
+
 class BluetoothPhoneAPI : public PhoneAPI
 {
     /**
@@ -98,6 +107,12 @@ void onCccd(uint16_t conn_hdl, BLECharacteristic *chr, uint16_t cccd_value)
 }
 void startAdv(void)
 {
+    // Rebuild advertising from scratch on every call so alternating (swapBitChatAdvertising)
+    // can re-run this without accumulating stale AD structures or overflowing the packet.
+    Bluefruit.Advertising.stop();
+    Bluefruit.Advertising.clearData();
+    Bluefruit.ScanResponse.clearData();
+
     // Advertising packet
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
     // IncludeService UUID
@@ -131,25 +146,38 @@ void startAdv(void)
     // Include Name
     // Bluefruit.Advertising.addName();
     
+    #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    // Only ONE 128-bit UUID fits in the 31-byte main packet, so alternate which one is there.
+    // iOS filters scans on the main packet only; the other UUID goes in the scan response
+    // (Android reads it there). Over a couple of cycles both the Meshtastic app and the
+    // BitChat apps get a window where their UUID is in the main packet -> discoverable on iOS.
+    // Scan-response budget is tight: TxPower(3) + shortName + one 128-bit UUID(18) is at the
+    // 31-byte edge, so check BOTH additions - a silent overflow drops a UUID and makes one app
+    // undiscoverable (Android reads scan-response UUIDs; iOS relies on the main packet).
+    bool bitchatAdded;
+    bool meshAdded;
+    if (bitchatAdvMainIsBitChat) {
+        // This cycle: BitChat UUID in main packet -> iOS BitChat app can discover us.
+        bitchatAdded = Bluefruit.Advertising.addUuid(BLEUuid(BITCHAT_SERVICE_UUID_16));
+        meshAdded = Bluefruit.ScanResponse.addService(meshBleService); // Meshtastic UUID in scan response
+        LOG_INFO("nRF52 adv: main=BitChat, scanResp=Meshtastic (bitchatAdded=%d, meshAdded=%d)", bitchatAdded, meshAdded);
+    } else {
+        // This cycle: Meshtastic UUID in main packet -> Meshtastic app can discover us.
+        meshAdded = Bluefruit.Advertising.addService(meshBleService);
+        bitchatAdded = Bluefruit.ScanResponse.addUuid(BLEUuid(BITCHAT_SERVICE_UUID_16)); // BitChat UUID in scan response
+        LOG_INFO("nRF52 adv: main=Meshtastic, scanResp=BitChat (bitchatAdded=%d, meshAdded=%d)", bitchatAdded, meshAdded);
+    }
+    if (!bitchatAdded) {
+        LOG_WARN("FAILED: Could not add BitChat UUID to advertising even with short name");
+    }
+    if (!meshAdded) {
+        LOG_WARN("FAILED: Could not add Meshtastic UUID to advertising (scan response overflow?)");
+    }
+    // Restore full name (GATT device name 0x2A00) after advertising is configured
+    Bluefruit.setName(fullName);
+    #else
     // Advertise Meshtastic service (primary)
     Bluefruit.Advertising.addService(meshBleService);
-    
-    // Add BitChat service UUID to scan response if BitChat module is enabled
-    #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
-    // BitChat service is created by BitChatBLEBridge, we just advertise its UUID
-    LOG_INFO("Attempting to add BitChat UUID to scan response...");
-    bool bitchatAdded = Bluefruit.ScanResponse.addUuid(BLEUuid(BITCHAT_SERVICE_UUID_16));
-    if (bitchatAdded) {
-        LOG_INFO("SUCCESS: BitChat UUID added to scan response - both services discoverable");
-        // Restore full name after advertising is set up
-        Bluefruit.setName(fullName);
-        LOG_INFO("Restored full BLE name: '%s'", fullName);
-    } else {
-        LOG_WARN("FAILED: Could not add BitChat UUID to scan response even with short name");
-        // Restore full name anyway
-        Bluefruit.setName(fullName);
-    }
-    #else
     LOG_INFO("BitChat module is excluded from build");
     #endif
     
@@ -348,6 +376,23 @@ void NRF52Bluetooth::resumeAdvertising()
     Bluefruit.Advertising.setInterval(32, 244); // in unit of 0.625 ms
     Bluefruit.Advertising.setFastTimeout(30);   // number of seconds in fast mode
     Bluefruit.Advertising.start(0);
+}
+
+// Flip which 128-bit service UUID sits in the main advertising packet and re-advertise.
+// Called on a timer (~ADV_ALTERNATE_INTERVAL_MS) from BitChatBridgeModule::runOnce().
+// Only runs while DISCONNECTED so an established link is never disturbed; startAdv() rebuilds
+// the advertising/scan-response data from scratch, and resumeAdvertising() restarts it.
+void NRF52Bluetooth::swapBitChatAdvertising()
+{
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    if (isConnected()) {
+        return; // Connected: leave advertising as-is; don't disturb the link
+    }
+    bitchatAdvMainIsBitChat = !bitchatAdvMainIsBitChat;
+    LOG_DEBUG("nRF52: Alternating advertising - main packet now carries %s UUID",
+              bitchatAdvMainIsBitChat ? "BitChat" : "Meshtastic");
+    startAdv(); // self-contained: stops, rebuilds adv + scan response, and restarts advertising
+#endif
 }
 /// Given a level between 0-100, update the BLE attribute
 void updateBatteryLevel(uint8_t level)

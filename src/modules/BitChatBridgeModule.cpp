@@ -7,8 +7,8 @@
 #include "Default.h"
 #include <SHA256.h>
 #if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+#include <Curve25519.h>
 #include <Ed25519.h>
-#include <RNG.h>
 #endif
 
 #if !MESHTASTIC_EXCLUDE_BLUETOOTH
@@ -35,11 +35,7 @@ BitChatBridgeModule::BitChatBridgeModule()
     messagesRelayed = 0;
     messagesBridged = 0;
     duplicatesDropped = 0;
-    
-    // Initialize message queue (fixed-size array, no dynamic allocation)
-    messageQueueHead = 0;
-    messageQueueTail = 0;
-    messageQueueCount = 0;
+    // messageQueue (BitChatMessageRing) self-initializes head/tail to 0
 }
 
 BitChatBridgeModule::~BitChatBridgeModule()
@@ -96,17 +92,20 @@ int32_t BitChatBridgeModule::runOnce()
         return 30000; // Check every 30 seconds when disabled
     }
     
-    // Initialize peer ID once nodeDB is ready
-    if (myBitChatPeerId == 0) {
-        myBitChatPeerId = nodeDB->getNodeNum();
-        if (myBitChatPeerId != 0) {
-            LOG_INFO("BitChat Bridge: Acting as peer ID 0x%08x", myBitChatPeerId);
-        }
+    // Derive our BitChat identity keys and peer ID as soon as the Meshtastic secret is
+    // populated. The peer ID is SHA256(noisePublicKey)[0..8] (set in initializeBitChatKeys),
+    // NOT the Meshtastic node number - iOS rejects announces whose senderID isn't the
+    // key-derived fingerprint. Safe to call repeatedly: it no-ops once done or if not ready.
+    if (!ed25519KeysInitialized) {
+        initializeBitChatKeys();
     }
     
 #if !MESHTASTIC_EXCLUDE_BLUETOOTH
-    // Set up BLE service on first run (after Bluetooth is initialized)
-    if (bleEnabled && !bleServiceSetup && config.bluetooth.enabled) {
+    // Set up BLE service (after Bluetooth is initialized). Retry on a backoff instead of
+    // permanently disabling BLE on a single failure - a transient failure should not
+    // require a reboot.
+    if (bleEnabled && !bleServiceSetup && config.bluetooth.enabled && millis() >= nextBleSetupAttempt) {
+        nextBleSetupAttempt = millis() + BLE_SETUP_RETRY_MS;
         LOG_DEBUG("BitChat Bridge: Attempting BLE service setup...");
 #ifdef ARCH_ESP32
         if (bleServer) {
@@ -131,12 +130,15 @@ int32_t BitChatBridgeModule::runOnce()
                 LOG_INFO("BitChat Bridge: Creating initial announcement for BLE characteristic...");
                 sendPeerAnnouncement();
             } else {
-                LOG_ERROR("BitChat Bridge: BLE service setup failed");
-                bleEnabled = false;
+                LOG_ERROR("BitChat Bridge: BLE service setup failed, will retry in %d ms", BLE_SETUP_RETRY_MS);
+                // Don't disable BLE - leave bleServiceSetup false so we retry. Bring up
+                // base Meshtastic advertising meanwhile so the device stays usable. Crucially
+                // do NOT mark the BitChat service ready here: startBaseAdvertising() advertises
+                // Meshtastic-only, so we never point phones at a BitChat GATT service that
+                // doesn't exist. The next retry will set it ready once setup actually succeeds.
                 if (nimbleBluetooth && !nimbleBluetooth->isDeInit) {
-                    LOG_WARN("BitChat Bridge: Starting advertising without BitChat service");
-                    nimbleBluetooth->setBitChatServiceReady();
-                    nimbleBluetooth->startAdvertising();
+                    LOG_WARN("BitChat Bridge: Advertising Meshtastic-only until BitChat setup succeeds");
+                    nimbleBluetooth->startBaseAdvertising();
                 }
             }
         }
@@ -159,8 +161,8 @@ int32_t BitChatBridgeModule::runOnce()
                 LOG_INFO("BitChat Bridge: Restarting advertising with BitChat service...");
                 nrf52Bluetooth->resumeAdvertising();
             } else {
-                LOG_ERROR("BitChat Bridge: BLE service setup failed");
-                bleEnabled = false;
+                LOG_ERROR("BitChat Bridge: BLE service setup failed, will retry in %d ms", BLE_SETUP_RETRY_MS);
+                // Don't disable BLE - leave bleServiceSetup false so we retry.
             }
         } else {
             LOG_DEBUG("BitChat Bridge: nrf52Bluetooth not ready yet");
@@ -168,6 +170,28 @@ int32_t BitChatBridgeModule::runOnce()
 #endif
     }
     
+    // Periodically alternate which service UUID sits in the main advertising packet, so the
+    // Meshtastic app AND the BitChat apps can each discover this node on iOS (iOS filters scans
+    // on the main packet only, and two 128-bit UUIDs don't fit in one legacy advertisement).
+    // Only swaps while disconnected; skipped entirely while a phone is connected.
+#if !MESHTASTIC_EXCLUDE_BITCHAT_BRIDGE
+    if (bleServiceSetup) {
+        uint32_t nowMs = millis();
+        if (nowMs - lastAdvAlternateTime >= ADV_ALTERNATE_INTERVAL_MS) {
+            lastAdvAlternateTime = nowMs;
+#ifdef ARCH_ESP32
+            if (nimbleBluetooth) {
+                nimbleBluetooth->swapBitChatAdvertising();
+            }
+#elif defined(ARCH_NRF52)
+            if (nrf52Bluetooth) {
+                nrf52Bluetooth->swapBitChatAdvertising();
+            }
+#endif
+        }
+    }
+#endif
+
     // Periodically ensure advertising is active on ESP32 (safety net).
     // NimBLE stops advertising on connect and relies on onDisconnect to restart it,
     // but if that callback is missed for any reason, advertising stays off silently.
@@ -179,16 +203,24 @@ int32_t BitChatBridgeModule::runOnce()
 #endif
 #endif
     
-    // Send periodic peer announcements (act as a BitChat peer)
+    // Send peer announcements (act as a BitChat peer)
     #if !MESHTASTIC_EXCLUDE_BLUETOOTH
     if (bleEnabled && bleServiceSetup) {
         uint32_t currentTime = millis();
-        uint32_t announceInterval = bleBridge.isServiceActive() 
-                                    ? 5000  // 5 seconds when connected
-                                    : ANNOUNCE_INTERVAL_MS;  // 30 seconds when not connected
-        if (currentTime - lastAnnounceTime >= announceInterval) {
+        // Service an immediate announcement requested by the BLE connect callback (signing
+        // runs here on the main thread, not in the callback).
+        if (announceRequested) {
+            announceRequested = false;
             sendPeerAnnouncement();
             lastAnnounceTime = currentTime;
+        } else {
+            uint32_t announceInterval = bleBridge.isServiceActive()
+                                        ? 5000
+                                        : ANNOUNCE_INTERVAL_MS;
+            if (currentTime - lastAnnounceTime >= announceInterval) {
+                sendPeerAnnouncement();
+                lastAnnounceTime = currentTime;
+            }
         }
     }
     #endif
@@ -199,20 +231,18 @@ int32_t BitChatBridgeModule::runOnce()
     // Process queued messages from BLE callbacks (deferred to avoid stack overflow in callbacks)
     // Process up to 2 messages per run to avoid blocking too long
     size_t processed = 0;
-    while (messageQueueCount > 0 && processed < 2) {
-        QueuedMessage queued = messageQueue[messageQueueHead];
-        messageQueueHead = (messageQueueHead + 1) % MAX_QUEUE_SIZE;
-        messageQueueCount--;
+    QueuedMessage queued;
+    while (processed < 2 && messageQueue.pop(queued)) {
         processBitChatMessage(queued.msg, queued.fromBLE);
         processed++;
     }
-    
+
     // Update statistics and cleanup
     updateStatistics();
-    
+
     // If we have queued messages, run more frequently to process them quickly
     // Otherwise, run every 5 seconds during normal operation
-    if (messageQueueCount > 0) {
+    if (!messageQueue.empty()) {
         return 100; // Process remaining messages quickly (100ms)
     }
     return 5000;
@@ -220,40 +250,35 @@ int32_t BitChatBridgeModule::runOnce()
 
 void BitChatBridgeModule::queueMessageForProcessing(const BitChatMessage& msg, bool fromBLE)
 {
-    // Queue message for deferred processing in main loop
-    // This prevents stack overflow when called from BLE callbacks
-    // Use simple fixed-size circular buffer (no dynamic allocation)
-    if (messageQueueCount >= MAX_QUEUE_SIZE) {
-        // Queue full - drop oldest message (same pattern as Router)
-        messageQueueHead = (messageQueueHead + 1) % MAX_QUEUE_SIZE;
-        messageQueueCount--;
-        LOG_WARN("BitChat Bridge: Message queue full, dropping oldest message");
+    // Producer side of the SPSC ring — safe to call from a BLE callback task.
+    QueuedMessage q;
+    q.msg = msg;
+    q.fromBLE = fromBLE;
+    if (!messageQueue.push(q)) {
+        LOG_WARN("BitChat Bridge: Message queue full, dropping message");
     }
-    
-    // Add new message
-    messageQueue[messageQueueTail].msg = msg;
-    messageQueue[messageQueueTail].fromBLE = fromBLE;
-    messageQueueTail = (messageQueueTail + 1) % MAX_QUEUE_SIZE;
-    messageQueueCount++;
 }
 
 void BitChatBridgeModule::processBitChatMessage(const BitChatMessage& msg, bool fromBLE)
 {
     logMessage(msg, fromBLE ? "BLE->Mesh" : "Mesh->BLE");
     
-    // Sync time from BLE messages (they have accurate timestamps from phones)
-    if (fromBLE && !timeSynced) {
+    // Learn real time from any BitChat peer timestamp (BLE phone or a relayed mesh
+    // message), but only as a fallback when Meshtastic's own RTC has no valid time. If the
+    // RTC is valid we prefer it directly (see computeAnnounceTimestampMs).
+    if (!haveSyncedBase && getValidTime(RTCQualityDevice) == 0) {
         uint64_t msgTimestampMs = msg.timestamp;
-        uint64_t ourTimeMs = static_cast<uint64_t>(getTime()) * 1000ULL;
-        
-        // Only sync if the message timestamp looks reasonable (within 50 years of Unix epoch)
+
+        // Only sync if the message timestamp looks reasonable (within ~50 years of epoch)
         const uint64_t year2020Ms = 1577836800000ULL; // Jan 1, 2020 in ms
         const uint64_t year2070Ms = 3155760000000ULL; // Jan 1, 2070 in ms
-        
+
         if (msgTimestampMs >= year2020Ms && msgTimestampMs <= year2070Ms) {
-            timeOffsetMs = static_cast<int64_t>(msgTimestampMs) - static_cast<int64_t>(ourTimeMs);
-            timeSynced = true;
-            LOG_INFO("BitChat Bridge: Time synced from BLE peer (offset: %lld ms)", (long long)timeOffsetMs);
+            syncedUnixMs0 = msgTimestampMs;
+            syncedAtMillis0 = millis();
+            haveSyncedBase = true;
+            LOG_INFO("BitChat Bridge: Time base learned from %s peer (%llu ms)",
+                     fromBLE ? "BLE" : "mesh", (unsigned long long)msgTimestampMs);
         }
     }
     
@@ -660,9 +685,19 @@ bool BitChatBridgeModule::handleFragment(const BitChatMessage& fragment)
  */
 void BitChatBridgeModule::sendPeerAnnouncement()
 {
+    // Don't announce until our identity keys exist: without them the senderID and signature
+    // would be invalid and every phone would reject the announce (iOS silently drops it).
+    if (!ed25519KeysInitialized) {
+        initializeBitChatKeys();
+        if (!ed25519KeysInitialized) {
+            LOG_DEBUG("BitChat Bridge: Skipping announcement - identity keys not ready yet");
+            return;
+        }
+    }
+
     BitChatMessage announcement = createPeerAnnouncement();
-    
-    LOG_INFO("BitChat Bridge: Sending peer announcement (ID: 0x%08x, TTL: %d, payload: %d bytes)", 
+
+    LOG_INFO("BitChat Bridge: Sending peer announcement (ID: 0x%08x, TTL: %d, payload: %d bytes)",
              myBitChatPeerId, announcement.ttl, announcement.payloadLength);
     
     // Broadcast via BLE - broadcastMessage() now handles both Peripheral and Central roles
@@ -680,20 +715,25 @@ void BitChatBridgeModule::sendPeerAnnouncement()
 BitChatMessage BitChatBridgeModule::createPeerAnnouncement()
 {
     BitChatMessage msg;
-    
+
     msg.type = BITCHAT_MSG_ANNOUNCE;
-    msg.setSenderId32(myBitChatPeerId);
-    // Timestamp in milliseconds since epoch (iOS format)
-    // Use synced time if available, otherwise use device time (will be rejected by iOS)
-    uint64_t deviceTimeMs = static_cast<uint64_t>(getTime()) * 1000ULL;
-    if (timeSynced) {
-        msg.timestamp = deviceTimeMs + static_cast<uint64_t>(timeOffsetMs);
-    } else {
-        msg.timestamp = deviceTimeMs;
-        // Log warning on first announcement before time sync
+    // Ensure identity keys (and the derived peer ID) exist before we stamp the senderID.
+    if (!ed25519KeysInitialized) {
+        initializeBitChatKeys();
+    }
+    // senderID = SHA256(noisePublicKey)[0..8]; iOS matches this against the announced Noise key.
+    memcpy(msg.senderId, myBitChatPeerId8, 8);
+    // Timestamp in milliseconds since epoch (iOS format).
+    // Prefer Meshtastic's RTC (GPS/NTP/mesh/app); fall back to a peer-learned base.
+    bool rtcValid = getValidTime(RTCQualityDevice) > 0;
+    uint64_t rtcTimeMs = static_cast<uint64_t>(getTime()) * 1000ULL;
+    msg.timestamp = computeAnnounceTimestampMs(rtcValid, rtcTimeMs, haveSyncedBase,
+                                               syncedUnixMs0, syncedAtMillis0, millis());
+    if (!rtcValid && !haveSyncedBase) {
+        // No real time source yet - announcement may be rejected until one appears
         static bool warnedAboutTime = false;
         if (!warnedAboutTime) {
-            LOG_WARN("BitChat Bridge: Sending announcement with unsynced time - may be rejected");
+            LOG_WARN("BitChat Bridge: Sending announcement with no real time source - may be rejected");
             warnedAboutTime = true;
         }
     }
@@ -716,19 +756,19 @@ BitChatMessage BitChatBridgeModule::createPeerAnnouncement()
     memcpy(&msg.payload[offset], deviceName, nicknameLen);
     offset += nicknameLen;
     
-    // TLV 2: Noise Public Key (0x02 + 0x20 + 32 bytes)
+    // Ensure identity keys are derived before we emit them
+    if (!ed25519KeysInitialized) {
+        initializeBitChatKeys();
+    }
+
+    // TLV 2: Noise Public Key (0x02 + 0x20 + 32 bytes) — real X25519 static public key
     msg.payload[offset++] = 0x02;
     msg.payload[offset++] = 32;
-    // Generate deterministic "public key" from node ID
-    for (int i = 0; i < 32; i++) {
-        msg.payload[offset++] = (myBitChatPeerId >> ((i % 4) * 8)) & 0xFF;
-    }
-    
+    memcpy(&msg.payload[offset], noisePublicKey, 32);
+    offset += 32;
+
     // TLV 3: Signing Public Key (0x03 + 0x20 + 32 bytes)
     // Use Ed25519 public key from rweather/Crypto library
-    if (!ed25519KeysInitialized) {
-        initializeEd25519Keys();
-    }
     msg.payload[offset++] = 0x03; // Type: signingPublicKey
     msg.payload[offset++] = 32;   // Length: 32 bytes
     memcpy(&msg.payload[offset], ed25519PublicKey, 32);
@@ -749,40 +789,95 @@ BitChatMessage BitChatBridgeModule::createPeerAnnouncement()
 // TweetNaCl removed - randombytes no longer needed
 
 /**
- * Initialize Ed25519 keys for signing announcements
- * Uses rweather/Crypto library (already in Meshtastic)
- * Generates keys deterministically from node ID for consistency across reboots
+ * Pure key-derivation helper: out = SHA256(secret32 || domainTag).
+ * Static and free of any global/BLE state so it can be unit-tested directly.
  */
-void BitChatBridgeModule::initializeEd25519Keys()
+void BitChatBridgeModule::deriveBitChatSeed(const uint8_t secret[32], const char* domainTag, uint8_t out[32])
+{
+    SHA256 sha;
+    sha.reset();
+    sha.update(secret, 32);
+    sha.update(domainTag, strlen(domainTag));
+    sha.finalize(out, 32);
+}
+
+/**
+ * Pure time helper (see header). Prefers the RTC when valid; otherwise advances a
+ * peer-learned absolute base by elapsed millis(). Never adds an offset to getTime(), so
+ * it can't double-count once the RTC becomes valid.
+ */
+uint64_t BitChatBridgeModule::computeAnnounceTimestampMs(bool rtcValid, uint64_t rtcTimeMs,
+                                                         bool haveSyncedBase, uint64_t syncedBaseMs,
+                                                         uint32_t syncedAtMillis, uint32_t nowMillis)
+{
+    if (rtcValid) {
+        return rtcTimeMs; // Meshtastic RTC is authoritative
+    }
+    if (haveSyncedBase) {
+        // uint32 subtraction handles millis() wraparound correctly
+        uint32_t elapsed = nowMillis - syncedAtMillis;
+        return syncedBaseMs + static_cast<uint64_t>(elapsed);
+    }
+    return rtcTimeMs; // best effort (likely near zero) - no real source yet
+}
+
+/**
+ * Derive BitChat identity keys from Meshtastic's persisted random secret.
+ *
+ * config.security.private_key is a 32-byte random key generated once and persisted by
+ * NodeDB (see NodeDB.cpp). We derive two independent BitChat keys from it via SHA256 with
+ * distinct domain tags:
+ *   - Ed25519 signing key (the rweather Ed25519 "private key" is itself a 32-byte seed)
+ *   - Noise static X25519 key (Curve25519::dh1 clamps the private and returns the public)
+ * This gives real entropy, deterministic identity across reboots, and no extra storage.
+ * Defers if the Meshtastic secret is not populated yet (like myBitChatPeerId).
+ */
+void BitChatBridgeModule::initializeBitChatKeys()
 {
     if (ed25519KeysInitialized) {
-        return; // Already initialized
+        return; // Already derived
     }
-    
-    // Generate a seed from node ID for deterministic key generation
-    // This ensures the same keys are generated across reboots
-    uint8_t seed[32];
-    memset(seed, 0, 32);
-    
-    // Create deterministic seed from node ID
-    // Mix in node ID multiple times for better distribution
-    for (int i = 0; i < 32; i++) {
-        seed[i] = static_cast<uint8_t>((myBitChatPeerId >> ((i % 4) * 8)) & 0xFF);
-        seed[i] ^= static_cast<uint8_t>((myBitChatPeerId >> (((i + 1) % 4) * 8)) & 0xFF);
-        seed[i] ^= 0xAA; // Add some variation
+
+    if (config.security.private_key.size != 32) {
+        LOG_WARN("BitChat Bridge: Meshtastic security key not ready, deferring key derivation");
+        return;
     }
-    
-    // Initialize RNG with deterministic seed
-    RNG.begin(optstr(APP_VERSION));
-    RNG.stir(seed, 32);
-    
-    Ed25519::generatePrivateKey(ed25519SecretKey);
-    
-    // Derive public key from private key
+    const uint8_t* secret = config.security.private_key.bytes;
+
+    // Ed25519 signing key
+    deriveBitChatSeed(secret, "bitchat-ed25519-v1", ed25519SecretKey);
     Ed25519::derivePublicKey(ed25519PublicKey, ed25519SecretKey);
-    
+
+    // Noise static X25519 key.
+    // NOTE: Curve25519::dh1() would OVERWRITE the private key with random bytes (it
+    // generates a fresh random keypair), which would give a different Noise identity every
+    // boot. To derive a stable key from our seed we clamp the scalar ourselves (exactly as
+    // dh1 does) and call eval() against the base point.
+    deriveBitChatSeed(secret, "bitchat-noise-v1", noisePrivateKey);
+    noisePrivateKey[0] &= 0xF8;
+    noisePrivateKey[31] = (noisePrivateKey[31] & 0x7F) | 0x40;
+    Curve25519::eval(noisePublicKey, noisePrivateKey, nullptr); // public = private * basepoint(9)
+
+    // Derive our BitChat peer ID exactly as iOS/Android do: the first 8 bytes of
+    // SHA256(noiseStaticPublicKey). iOS's announce preflight computes PeerID(publicKey:) from
+    // the announced Noise key and rejects the announce unless the packet senderID matches, so
+    // the senderID CANNOT be the Meshtastic node number - it must be this fingerprint.
+    uint8_t noiseFingerprint[32];
+    SHA256 idSha;
+    idSha.reset();
+    idSha.update(noisePublicKey, 32);
+    idSha.finalize(noiseFingerprint, 32);
+    memcpy(myBitChatPeerId8, noiseFingerprint, 8);
+    // Keep the 32-bit id (log-only) consistent with the real fingerprint.
+    myBitChatPeerId = 0;
+    for (int i = 0; i < 4; i++) {
+        myBitChatPeerId |= (static_cast<uint32_t>(myBitChatPeerId8[i]) << (i * 8));
+    }
+
     ed25519KeysInitialized = true;
-    LOG_INFO("BitChat Bridge: Ed25519 keys initialized (using rweather/Crypto library)");
+    LOG_INFO("BitChat Bridge: Derived Ed25519 + Noise keys; peer ID %02x%02x%02x%02x%02x%02x%02x%02x",
+             myBitChatPeerId8[0], myBitChatPeerId8[1], myBitChatPeerId8[2], myBitChatPeerId8[3],
+             myBitChatPeerId8[4], myBitChatPeerId8[5], myBitChatPeerId8[6], myBitChatPeerId8[7]);
 }
 
 /**
@@ -842,7 +937,11 @@ static size_t applyPadding(uint8_t* data, size_t dataLen, size_t maxLen)
 bool BitChatBridgeModule::signAnnouncement(BitChatMessage& msg)
 {
     if (!ed25519KeysInitialized) {
-        initializeEd25519Keys();
+        initializeBitChatKeys();
+    }
+    if (!ed25519KeysInitialized) {
+        LOG_WARN("BitChat Bridge: Cannot sign - keys not ready");
+        return false;
     }
     
     // Create a copy of the message with TTL=0 and no signature for signing

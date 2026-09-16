@@ -12,16 +12,16 @@ uint32_t BitChatDuplicateCache::calculateHash(const BitChatMessage& msg)
     
     struct HashData {
         uint32_t senderId;
-        uint32_t timestamp;
+        uint64_t timestamp;
         uint8_t messageType;
         uint8_t payloadLength;
         uint8_t payload[BITCHAT_MAX_PAYLOAD_SIZE];
     } __attribute__((packed));
-    
+
     HashData hashData = {};
     hashData.senderId = msg.getSenderId32();
-    // Use lower 32 bits of timestamp for hash (for backward compatibility)
-    hashData.timestamp = static_cast<uint32_t>(msg.timestamp & 0xFFFFFFFFULL);
+    // Hash over the full 64-bit millisecond timestamp (no truncation)
+    hashData.timestamp = msg.timestamp;
     hashData.messageType = msg.type;
     hashData.payloadLength = msg.payloadLength;
     
@@ -49,38 +49,25 @@ uint32_t BitChatDuplicateCache::calculateHash(const BitChatMessage& msg)
 bool BitChatDuplicateCache::isDuplicate(const BitChatMessage& msg)
 {
     uint32_t hash = calculateHash(msg);
-    
-    // Check if message already exists in cache
+    uint32_t msgSenderId = msg.getSenderId32();
+
+    // Exact match on (sender, full timestamp, type, content hash) is the correct
+    // dedup key — the hash already covers the payload, so any real retransmission
+    // of the same message produces the same fingerprint.
     for (size_t i = 0; i < cache.size(); i++) {
         const auto& entry = cache[i];
-        
-        uint32_t msgSenderId = msg.getSenderId32();
-        uint32_t msgTimestamp32 = static_cast<uint32_t>(msg.timestamp & 0xFFFFFFFFULL);
-        
-        // Check for exact match
-        if (entry.senderId == msgSenderId && 
-            entry.timestamp == msgTimestamp32 &&
+
+        if (entry.senderId == msgSenderId &&
+            entry.timestamp == msg.timestamp &&
             entry.messageType == msg.type &&
             entry.hash == hash) {
-            
-            LOG_DEBUG("BitChat: Duplicate message detected - sender=0x%08x, timestamp=%u, type=0x%02x",
-                     msgSenderId, msgTimestamp32, msg.type);
-            return true;
-        }
-        
-        // Also check for messages that are very similar (potential retransmissions)
-        // Allow small timestamp variations to handle clock skew
-        if (entry.senderId == msgSenderId &&
-            entry.messageType == msg.type &&
-            entry.hash == hash &&
-            abs(static_cast<int32_t>(entry.timestamp) - static_cast<int32_t>(msgTimestamp32)) <= 5) {
-            
-            LOG_DEBUG("BitChat: Near-duplicate message detected (timestamp skew) - sender=0x%08x", 
-                     msgSenderId);
+
+            LOG_DEBUG("BitChat: Duplicate message detected - sender=0x%08x, timestamp=%llu, type=0x%02x",
+                     msgSenderId, (unsigned long long)msg.timestamp, msg.type);
             return true;
         }
     }
-    
+
     return false;
 }
 
@@ -90,14 +77,13 @@ void BitChatDuplicateCache::addMessage(const BitChatMessage& msg)
     auto& entry = cache[currentIndex];
     
     entry.senderId = msg.getSenderId32();
-    // Use lower 32 bits of timestamp for cache (for backward compatibility)
-    entry.timestamp = static_cast<uint32_t>(msg.timestamp & 0xFFFFFFFFULL);
+    entry.timestamp = msg.timestamp;
     entry.messageType = msg.type;
     entry.hash = calculateHash(msg);
-    
+
     // Move to next cache slot
     currentIndex = (currentIndex + 1) % cache.size();
-    
-    LOG_DEBUG("BitChat: Added message to cache - sender=0x%08x, timestamp=%u, hash=0x%08x",
-              entry.senderId, entry.timestamp, entry.hash);
+
+    LOG_DEBUG("BitChat: Added message to cache - sender=0x%08x, timestamp=%llu, hash=0x%08x",
+              entry.senderId, (unsigned long long)entry.timestamp, entry.hash);
 }

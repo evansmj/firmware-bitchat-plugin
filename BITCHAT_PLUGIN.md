@@ -42,7 +42,7 @@ The plugin can be enabled/disabled by commenting/uncommenting the build flag in 
 
 The Meshtastic device acts as a full BitChat peer:
 
-- **Peer ID**: Derived from the Meshtastic node ID (`nodeDB->getNodeNum()`)
+- **Peer ID**: The 8-byte key fingerprint `SHA256(noiseStaticPublicKey)[0..8]` (stored in `myBitChatPeerId8`), NOT the Meshtastic node ID. iOS re-derives this from the announced Noise key and rejects an announce whose senderID doesn't match. (`myBitChatPeerId`, the low 4 bytes, is log-only.)
 - **Device Name**: Uses the owner's long name from Meshtastic settings (format: `"Meshtastic: <device_name>"`)
 - **Announcements**: Sent every 30 seconds to connected BitChat apps
 - **Visibility**: Appears in the "people nearby" counter on BitChat iOS/Android apps
@@ -180,7 +180,7 @@ DEBUG | BitChat BLE: Broadcasting message type 0x01 to BLE
 - Announcements are only sent when BLE is enabled and setup is complete
 - The device name comes from Meshtastic's owner settings
 - If no device name is set, defaults to "Meshtastic"
-- Peer ID is stable (derived from node ID), so the device has a consistent identity
+- Peer ID is stable (derived deterministically from the node's Noise static key, itself derived from `config.security.private_key`), so the device has a consistent identity across reboots
 - Serial/USB connections to Meshtastic app are unaffected by BitChat plugin
 
 ## License

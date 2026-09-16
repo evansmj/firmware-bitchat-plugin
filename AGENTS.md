@@ -58,6 +58,28 @@ Meshtastic wrap:   magic "BCHT"(4) | full BitChat message
 - **Announcement TLV payload**: 0x01=nickname, 0x02=Noise pubkey(32B), 0x03=Ed25519 signing pubkey(32B)
 - **Signature**: Ed25519 over serialized message with TTL=0, PKCS#7 padded to block boundary (matching Android BinaryProtocol format)
 
+## Critical BLE Gotchas (iOS vs Android)
+
+These are hard-won. iOS's CoreBluetooth is much stricter than Android in two independent places. Breaking either makes a node **silently** invisible on iOS while still working on Android — so iOS regressions do not show up in Android testing. **Always test discovery AND peer display on a real iPhone/iPad after any change here.**
+
+### 1. Discovery: the scanned UUID MUST be in the MAIN advertising packet (not the scan response)
+- iOS scans with a service-UUID **filter** (`scanForPeripherals(withServices:[uuid])`) and only matches UUIDs in the **primary advertising packet**. It **ignores the scan response** for filter matching. Android merges adv + scan response, so it matches either — this is why "works on Android" proves nothing about iOS.
+- A 31-byte legacy advertisement holds only **one** 128-bit UUID. We must serve BOTH the Meshtastic UUID (for the official Meshtastic app, which also iOS-filter-scans) AND the BitChat UUID (for BitChat apps).
+- **Solution in place:** we **alternate** which UUID is in the main packet every `ADV_ALTERNATE_INTERVAL_MS` (~4s), only while disconnected. See `src/nimble/AGENTS.md` (ESP32) and `src/platform/nrf52/AGENTS.md` (nRF52). **Do NOT** "simplify" this by moving one UUID permanently to the scan response — it breaks one of the two apps on iOS.
+- Extended advertising (BLE 5, which fits both UUIDs) is **not** an option: nRF52 Bluefruit is legacy-only, and NimBLE ext-adv needs a global build flag + rewrite.
+
+### 2. Peer display: the ANNOUNCE must pass iOS's strict validation
+iOS drops an announce **silently** (node connects, messages may even flow, but no peer appears) unless ALL of:
+- **senderID == `SHA256(noiseStaticPublicKey)[0..8]`**. iOS derives the expected peer ID from the announced Noise key (`PeerID(publicKey:)`) and rejects `.senderMismatch` otherwise. **Never** set senderID to `nodeDB->getNodeNum()`. See `myBitChatPeerId8` in `src/modules/`.
+- **Valid Ed25519 signature** over `encode(packet with TTL=0, no signature) + PKCS#7 padding`. iOS has "no backward compatibility" — unsigned/invalid announces are ignored.
+- **Fresh timestamp**. iOS rejects **stale** announces, so a node with no valid time source (GPS/NTP/mesh/phone) won't appear until it syncs time. Timestamp is ms since epoch.
+- The announced Noise pubkey (TLV 0x02) and Ed25519 signing pubkey (TLV 0x03) must be the real keys that back the senderID and signature.
+
+### 3. Advertising lifecycle
+- A connected BLE peripheral **stops advertising** — so only ONE phone can discover a node at a time; the other waits until it disconnects. This is inherent, not a bug.
+- Reconfiguring advertising while a phone is mid-connection can drop that attempt (it retries). Only reconfigure/alternate **while disconnected**.
+- iOS caches the GATT service table across reflashes ("sticky cache"). If services change and the node doesn't emit a **Service Changed** indication (`0x1801`/`0x2A05`), iOS may keep the stale table; manual recovery (Forget device / Reset Network Settings) is unreliable. (Not yet implemented — candidate improvement.)
+
 ## Build System
 
 PlatformIO-based. Key commands:
@@ -87,7 +109,7 @@ bin/build-nrf52.sh
 - **Memory**: Fixed-size arrays preferred over dynamic allocation. Circular buffers for caches/queues. Especially constrained on nRF52.
 - **BLE callbacks**: Limited stack — queue messages via `queueMessageForProcessing()`, process in `runOnce()`
 - **Timestamps**: Milliseconds since Unix epoch (`uint64_t`), matching iOS/Android BitChat format
-- **Peer ID**: Derived from `nodeDB->getNodeNum()` — stable across reboots
+- **Peer ID**: MUST be `SHA256(noiseStaticPublicKey)[0..8]` (see `myBitChatPeerId8`), NOT `nodeDB->getNodeNum()`. iOS rejects announces whose senderID isn't the key fingerprint. See "Critical BLE Gotchas" below and `src/modules/AGENTS.md`.
 - **Crypto**: Ed25519 via `rweather/Crypto` library (`<Ed25519.h>`, `<RNG.h>`)
 - **Non-interference**: Plugin must not break existing Meshtastic BLE, Serial, or mesh routing
 
