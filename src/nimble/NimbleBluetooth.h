@@ -1,6 +1,10 @@
 #pragma once
 #include "BluetoothCommon.h"
 
+#ifndef NIMBLE_TWO
+class NimBLEAdvertisementData;
+#endif
+
 class NimbleBluetooth : BluetoothApi
 {
   public:
@@ -21,6 +25,12 @@ class NimbleBluetooth : BluetoothApi
 
   private:
     void setupService();
+#ifndef NIMBLE_TWO
+    // Build the legacy 31-byte advertising + scan-response payloads for the current
+    // alternation state. Shared by startAdvertising() and the in-place update in
+    // swapBitChatAdvertising().
+    void buildLegacyAdvertisingData(NimBLEAdvertisementData &advertisingData, NimBLEAdvertisementData &scanResponse);
+#endif
     bool bitChatAdvertisingDeferred = false;
     // Whether the BitChat GATT service has actually been created. Until it has, advertising
     // must NOT include the BitChat UUID - otherwise phones try to connect to a service that
